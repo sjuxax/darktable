@@ -1662,7 +1662,7 @@ void dt_ioppr_update_for_style_items(dt_develop_t *dev,
     if(si->params_size > 0)
     {
       dt_iop_order_entry_t *n = malloc(sizeof(dt_iop_order_entry_t));
-      memcpy(n->operation, si->operation, sizeof(n->operation));
+      g_strlcpy(n->operation, si->operation, sizeof(n->operation));
       n->instance = si->multi_priority;
       g_strlcpy(n->name, si->multi_name, sizeof(n->name));
       n->o.iop_order = 0;
