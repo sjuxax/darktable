@@ -326,7 +326,7 @@ static void _commit_box(dt_iop_module_t *self,
                         dt_iop_crop_params_t *p,
                         const gboolean enforce_history)
 {
-  if(darktable.gui->reset)
+  if(DT_IN_GUI_UPDATE())
     return;
   if(self->dev->preview_pipe->status != DT_DEV_PIXELPIPE_VALID)
     return;
@@ -532,7 +532,7 @@ void modify_roi_out(dt_iop_module_t *self,
   roi_out->width = MAX(4, (int)odx);
   roi_out->height = MAX(4, (int)ody);
 
-  const gboolean exporting = piece->pipe->type & (DT_DEV_PIXELPIPE_EXPORT | DT_DEV_PIXELPIPE_THUMBNAIL);
+  const gboolean exporting = dt_pipe_is_export(piece->pipe) || dt_pipe_is_thumb(piece->pipe);
   const gboolean aligned = d->ratio_d != 0 && d->ratio_n != 0;
   if(!exporting || !aligned)
     return;
@@ -609,7 +609,7 @@ int process_cl(dt_iop_module_t *self,
                const dt_iop_roi_t *const roi_in,
                const dt_iop_roi_t *const roi_out)
 {
-  size_t region[] = { roi_out->width, roi_out->height };
+  const size_t region[2] = { roi_out->width, roi_out->height };
   return dt_opencl_enqueue_copy_image(piece->pipe->devid, dev_in, dev_out, CLIMG_ORIGIN, CLIMG_ORIGIN, region);
 }
 #endif
@@ -622,7 +622,7 @@ void commit_params(dt_iop_module_t *self,
   dt_iop_crop_params_t *p = (dt_iop_crop_params_t *)p1;
   dt_iop_crop_data_t *d = piece->data;
 
-  if(dt_iop_has_focus(self) && (pipe->type & DT_DEV_PIXELPIPE_BASIC))
+  if(dt_iop_has_focus(self) && dt_pipe_is_basic(pipe))
   {
     d->cx = 0.0f;
     d->cy = 0.0f;
@@ -1030,7 +1030,7 @@ static void _event_aspect_presets_changed(GtkWidget *combo, dt_iop_module_t *sel
 
     dt_conf_set_int("plugins/darkroom/crop/ratio_d", abs(p->ratio_d));
     dt_conf_set_int("plugins/darkroom/crop/ratio_n", abs(p->ratio_n));
-    if(darktable.gui->reset)
+    if(DT_IN_GUI_UPDATE())
       return;
     _aspect_apply(self, GRAB_HORIZONTAL);
     dt_control_queue_redraw_center();
@@ -1051,7 +1051,7 @@ static void _event_aspect_presets_changed(GtkWidget *combo, dt_iop_module_t *sel
   }
 
   // Update combobox label
-  ++darktable.gui->reset;
+  DT_ENTER_GUI_UPDATE();
 
   if(act == -1)
   {
@@ -1067,7 +1067,7 @@ static void _event_aspect_presets_changed(GtkWidget *combo, dt_iop_module_t *sel
     dt_bauhaus_combobox_set(g->aspect_presets, act);
   }
 
-  --darktable.gui->reset;
+  DT_LEAVE_GUI_UPDATE();
   _commit_box(self, g, p, TRUE);
 }
 
@@ -1088,7 +1088,7 @@ void gui_changed(dt_iop_module_t *self, GtkWidget *w, void *previous)
   dt_iop_crop_gui_data_t *g = self->gui_data;
   dt_iop_crop_params_t *p = self->params;
 
-  ++darktable.gui->reset;
+  DT_ENTER_GUI_UPDATE();
 
   if(w == g->cx)
   {
@@ -1116,7 +1116,7 @@ void gui_changed(dt_iop_module_t *self, GtkWidget *w, void *previous)
   // update all sliders, as their values may have change to keep aspect ratio
   _update_sliders_and_limit(g);
 
-  --darktable.gui->reset;
+  DT_LEAVE_GUI_UPDATE();
   _commit_box(self, g, p, TRUE);
 }
 
@@ -1388,13 +1388,19 @@ void gui_init(dt_iop_module_t *self)
 
   g_signal_connect(G_OBJECT(g->aspect_presets), "value-changed",
                    G_CALLBACK(_event_aspect_presets_changed), self);
+
   gtk_widget_set_tooltip_text
     (g->aspect_presets,
      _("set the aspect ratio\n"
        "the list is sorted: from most square to least square\n"
        "to enter custom aspect ratio open the combobox and type ratio in x:y"
        " or decimal format"));
-  dt_bauhaus_widget_set_quad(g->aspect_presets, self, dtgtk_cairo_paint_aspectflip, FALSE, _event_aspect_flip, NULL);
+  dt_bauhaus_widget_set_quad(g->aspect_presets,
+                             self,
+                             dtgtk_cairo_paint_aspectflip,
+                             FALSE,
+                             _event_aspect_flip,
+                             _("flip crop orientation between horizontal and vertical"));
 
   GtkWidget *box_enabled = dt_gui_vbox(g->aspect_presets);
 
@@ -1792,9 +1798,9 @@ int mouse_moved(dt_iop_module_t *self,
     // image has changed when it actually hasn't, yet.  The actual
     // clipping parameters get set from the sliders when the iop loses
     // focus, at which time the final selected crop is applied.
-    ++darktable.gui->reset;
+    DT_ENTER_GUI_UPDATE();
     _update_sliders_and_limit(g);
-    --darktable.gui->reset;
+    DT_LEAVE_GUI_UPDATE();
 
     dt_control_queue_redraw_center();
     return 1;

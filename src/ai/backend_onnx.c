@@ -18,7 +18,6 @@
 
 #include "backend.h"
 #include "common/darktable.h"
-#include "common/file_location.h"
 #include "control/conf.h"
 #include <glib.h>
 #include <onnxruntime_c_api.h>
@@ -56,34 +55,48 @@ struct dt_ai_context_t
   gboolean dynamic_outputs;
 };
 
-// minimum ORT API we'll fall back to when the runtime library is older
-// than what we were compiled against. v14 = ORT 1.14, the first release
-// with ONNX opset 18 support — older ORT can't run our models. bump
-// this in lockstep with any model that requires a newer opset
-#define DT_ORT_MIN_API_VERSION 14
+// minimum ORT API we accept. v18 = ORT 1.18, required for ROCm 6.0
+// and the V2 CUDA EP options API. caps ONNX opset at 20 — bump in
+// lockstep with any model that needs a newer opset
+#define DT_ORT_MIN_API_VERSION 18
 
-// global singletons (initialized exactly once via g_once)
-// ORT requires at most one OrtEnv per process.
-static const OrtApi *g_ort = NULL;
-static GOnce g_ort_once = G_ONCE_INIT;
-static OrtEnv *g_env = NULL;
-static GOnce g_env_once = G_ONCE_INIT;
-static GModule *g_ort_module = NULL;  // custom ORT library loaded via g_module_open
-// snapshot of plugins/ai/ort_library_path at ORT load — lets the prefs
-// page detect a path change mid-session (in-process ORT stale, restart
-// needed before GPU EP probes reflect the new library)
-static gchar *g_ort_conf_path_at_load = NULL;
-// snapshot of per-EP device_id at ORT load. -1 = "no value seen yet"
-// (e.g. provider not configured at startup); the change check then
-// compares against the current conf value
-static int g_loaded_cuda_device_id     = -1;
-static int g_loaded_migraphx_device_id = -1;
-static int g_loaded_dml_device_id      = -1;
+// cache size for per-device VRAM lookups; ORT also uses a uint32 device id
+#define DT_AI_MAX_CUDA_DEVICES 8
 
-// snapshot of the provider config string at ORT load. NULL until captured
-static gchar *g_loaded_provider = NULL;
+// ORT runtime singletons (one OrtApi + one OrtEnv per process,
+// initialized lazily via g_once)
+static struct {
+  const OrtApi *api;
+  OrtEnv       *env;
+  GOnce         api_once;
+  GOnce         env_once;
+  GModule      *module;     // custom ORT lib loaded via g_module_open
+  gchar        *version;    // GetVersionString() captured at load
+} g_ort = {
+  .api_once = G_ONCE_INIT,
+  .env_once = G_ONCE_INIT,
+};
+
+// snapshot of conf state at ORT load. *_changed_since_load helpers
+// compare current conf against these; -1 means "not yet captured"
+// (e.g. provider not configured at startup)
+static struct {
+  gchar *ort_path;
+  gchar *provider;
+  int    cuda_device_id;
+  int    migraphx_device_id;
+  int    dml_device_id;
+} g_conf_snapshot = {
+  .cuda_device_id     = -1,
+  .migraphx_device_id = -1,
+  .dml_device_id      = -1,
+};
 
 static int _device_id_from_conf(const char *conf_key, const char *env_var);
+static gchar *_lookup_device_name(const dt_ai_provider_t provider,
+                                  const int device_id);
+static gchar *_backend_cache_fingerprint(dt_ai_provider_t provider,
+                                         int device_id);
 
 #if defined(__linux__)
 // check that the CUDA driver supports the installed CUDA runtime version;
@@ -195,38 +208,45 @@ char *dt_ai_ort_probe_library(const char *path)
 void dt_ai_snapshot_conf_state(void)
 {
   gchar *ort_conf = dt_conf_get_string("plugins/ai/ort_library_path");
-  g_free(g_ort_conf_path_at_load);
-  g_ort_conf_path_at_load = g_strdup(ort_conf ? ort_conf : "");
+  g_free(g_conf_snapshot.ort_path);
+  g_conf_snapshot.ort_path = g_strdup(ort_conf ? ort_conf : "");
   g_free(ort_conf);
 
-  g_free(g_loaded_provider);
-  g_loaded_provider = dt_conf_get_string(DT_AI_CONF_PROVIDER);
-  if(!g_loaded_provider) g_loaded_provider = g_strdup("");
+  g_free(g_conf_snapshot.provider);
+  g_conf_snapshot.provider = dt_conf_get_string(DT_AI_CONF_PROVIDER);
+  if(!g_conf_snapshot.provider) g_conf_snapshot.provider = g_strdup("");
 
-  g_loaded_cuda_device_id     = _device_id_from_conf("plugins/ai/cuda_device_id",
+  g_conf_snapshot.cuda_device_id     = _device_id_from_conf("plugins/ai/cuda_device_id",
                                                      "DT_CUDA_DEVICE_ID");
-  g_loaded_migraphx_device_id = _device_id_from_conf("plugins/ai/migraphx_device_id",
+  g_conf_snapshot.migraphx_device_id = _device_id_from_conf("plugins/ai/migraphx_device_id",
                                                      "DT_MIGRAPHX_DEVICE_ID");
-  g_loaded_dml_device_id      = _device_id_from_conf("plugins/ai/dml_device_id",
+  g_conf_snapshot.dml_device_id      = _device_id_from_conf("plugins/ai/dml_device_id",
                                                      "DT_DML_DEVICE_ID");
+}
+
+void dt_ai_backend_cleanup_globals(void)
+{
+  g_free(g_ort.version);            g_ort.version = NULL;
+  g_free(g_conf_snapshot.ort_path); g_conf_snapshot.ort_path = NULL;
+  g_free(g_conf_snapshot.provider); g_conf_snapshot.provider = NULL;
 }
 
 gboolean dt_ai_ort_path_changed_since_load(void)
 {
-  if(!g_ort_conf_path_at_load) return FALSE;
+  if(!g_conf_snapshot.ort_path) return FALSE;
   gchar *cur = dt_conf_get_string("plugins/ai/ort_library_path");
   const gboolean changed
-    = g_strcmp0(cur ? cur : "", g_ort_conf_path_at_load) != 0;
+    = g_strcmp0(cur ? cur : "", g_conf_snapshot.ort_path) != 0;
   g_free(cur);
   return changed;
 }
 
 gboolean dt_ai_provider_changed_since_load(void)
 {
-  if(!g_loaded_provider) return FALSE;
+  if(!g_conf_snapshot.provider) return FALSE;
   gchar *cur = dt_conf_get_string(DT_AI_CONF_PROVIDER);
   const gboolean changed
-    = g_strcmp0(cur ? cur : "", g_loaded_provider) != 0;
+    = g_strcmp0(cur ? cur : "", g_conf_snapshot.provider) != 0;
   g_free(cur);
   return changed;
 }
@@ -257,9 +277,9 @@ gboolean dt_ai_device_id_changed_since_load(const dt_ai_provider_t provider)
   int loaded;
   switch(provider)
   {
-    case DT_AI_PROVIDER_CUDA:     loaded = g_loaded_cuda_device_id;     break;
-    case DT_AI_PROVIDER_MIGRAPHX: loaded = g_loaded_migraphx_device_id; break;
-    case DT_AI_PROVIDER_DIRECTML: loaded = g_loaded_dml_device_id;      break;
+    case DT_AI_PROVIDER_CUDA:     loaded = g_conf_snapshot.cuda_device_id;     break;
+    case DT_AI_PROVIDER_MIGRAPHX: loaded = g_conf_snapshot.migraphx_device_id; break;
+    case DT_AI_PROVIDER_DIRECTML: loaded = g_conf_snapshot.dml_device_id;      break;
     default:                      return FALSE;
   }
   if(loaded < 0) return FALSE;  // ORT not yet loaded
@@ -267,9 +287,67 @@ gboolean dt_ai_device_id_changed_since_load(const dt_ai_provider_t provider)
   return cur != loaded;
 }
 
-// shell out to a command and return its stdout. caller frees. NULL on failure
+// shell out to a command and return its stdout (caller frees, NULL on failure).
+// Windows path uses CreateProcessA directly so a GUI-subsystem parent doesn't
+// flash a console window when spawning console children (nvidia-smi, rocminfo).
+// caller must pass an ASCII command without quoted paths -- the Windows
+// branch doesn't shell-tokenize and Linux's g_spawn parses different rules
 static gchar *_run_capture(const char *cmd)
 {
+#ifdef _WIN32
+  SECURITY_ATTRIBUTES sa = { 0 };
+  sa.nLength = sizeof(sa);
+  sa.bInheritHandle = TRUE;
+
+  HANDLE rd = NULL, wr = NULL;
+  if(!CreatePipe(&rd, &wr, &sa, 0))
+    return NULL;
+  // read end must not be inherited or ReadFile never sees EOF
+  SetHandleInformation(rd, HANDLE_FLAG_INHERIT, 0);
+
+  STARTUPINFOA si = { 0 };
+  si.cb = sizeof(si);
+  si.dwFlags = STARTF_USESHOWWINDOW | STARTF_USESTDHANDLES;
+  si.wShowWindow = SW_HIDE;
+  si.hStdOutput = wr;
+  si.hStdError = wr;
+  si.hStdInput = NULL;
+
+  PROCESS_INFORMATION pi = { 0 };
+  // CreateProcessA writes into the cmdline buffer
+  gchar *cmdline = g_strdup(cmd);
+  const BOOL ok = CreateProcessA(NULL, cmdline,
+                                 NULL, NULL, TRUE,
+                                 CREATE_NO_WINDOW,
+                                 NULL, NULL, &si, &pi);
+  g_free(cmdline);
+  CloseHandle(wr);
+  if(!ok)
+  {
+    CloseHandle(rd);
+    return NULL;
+  }
+
+  GString *out = g_string_new(NULL);
+  char buf[4096];
+  DWORD n = 0;
+  while(ReadFile(rd, buf, sizeof(buf), &n, NULL) && n > 0)
+    g_string_append_len(out, buf, (gssize)n);
+  CloseHandle(rd);
+
+  WaitForSingleObject(pi.hProcess, INFINITE);
+  DWORD exit_code = 0;
+  GetExitCodeProcess(pi.hProcess, &exit_code);
+  CloseHandle(pi.hProcess);
+  CloseHandle(pi.hThread);
+
+  if(exit_code != 0)
+  {
+    g_string_free(out, TRUE);
+    return NULL;
+  }
+  return g_string_free(out, FALSE);
+#else
   gchar *out = NULL;
   GError *err = NULL;
   gint exit_status = 0;
@@ -285,6 +363,7 @@ static gchar *_run_capture(const char *cmd)
     return NULL;
   }
   return out;
+#endif
 }
 
 // CUDA device enumeration via nvidia-smi. respects CUDA_VISIBLE_DEVICES
@@ -552,7 +631,7 @@ int dt_ai_ort_probe_library_full(const char *path, char **out_version, char **ou
   return TRUE;
 }
 
-// find libonnxruntime.so.* recursively, skip auditwheel *.libs/ peers
+// find the ORT runtime library recursively, skipping *.libs/ peers
 static gchar *_scan_for_ort_lib(const char *root)
 {
   GDir *d = g_dir_open(root, 0, NULL);
@@ -567,7 +646,11 @@ static gchar *_scan_for_ort_lib(const char *root)
       if(!g_str_has_suffix(name, ".libs"))
         result = _scan_for_ort_lib(p);
     }
+#ifdef _WIN32
+    else if(g_strcmp0(name, "onnxruntime.dll") == 0)
+#else
     else if(g_str_has_prefix(name, "libonnxruntime.so."))
+#endif
     {
       result = g_strdup(p);
     }
@@ -618,33 +701,11 @@ GList *dt_ai_ort_find_libraries(void)
     if(g_file_test(dir, G_FILE_TEST_IS_DIR))
     {
 #ifdef _WIN32
-      // look for onnxruntime.dll
-      gchar *exact = g_build_filename(dir, "onnxruntime.dll", NULL);
-      if(g_file_test(exact, G_FILE_TEST_EXISTS))
-      {
-        user_paths[i] = exact;
-      }
-      else
-      {
-        g_free(exact);
-        GDir *d = g_dir_open(dir, 0, NULL);
-        if(d)
-        {
-          const gchar *name;
-          while((name = g_dir_read_name(d)))
-          {
-            if(g_str_has_prefix(name, "onnxruntime") &&
-               g_str_has_suffix(name, ".dll"))
-            {
-              user_paths[i] = g_build_filename(dir, name, NULL);
-              break;
-            }
-          }
-          g_dir_close(d);
-        }
-      }
+      const char *flat_name = "onnxruntime.dll";
 #else
-      gchar *exact = g_build_filename(dir, "libonnxruntime.so", NULL);
+      const char *flat_name = "libonnxruntime.so";
+#endif
+      gchar *exact = g_build_filename(dir, flat_name, NULL);
       if(g_file_test(exact, G_FILE_TEST_EXISTS))
       {
         user_paths[i] = exact;
@@ -652,10 +713,8 @@ GList *dt_ai_ort_find_libraries(void)
       else
       {
         g_free(exact);
-        // preserve_layout puts the lib in onnxruntime/capi/
         user_paths[i] = _scan_for_ort_lib(dir);
       }
-#endif
     }
     g_free(dir);
   }
@@ -728,6 +787,8 @@ static const OrtApi *_ort_api_from_module(GModule *mod, const char *label)
   }
   const OrtApiBase *base = get_api_base();
   const char *lib_version = base->GetVersionString();
+  g_free(g_ort.version);
+  g_ort.version = g_strdup(lib_version ? lib_version : "unknown");
   dt_print(DT_DEBUG_AI, "[darktable_ai] loaded ORT %s from '%s'", lib_version, label);
 
   // try the compiled API version first, then fall back to lower versions
@@ -800,7 +861,7 @@ static gpointer _init_ort_api(gpointer data)
                ort_override, g_module_error());
       goto done;
     }
-    g_ort_module = ort_mod;  // keep handle for _try_provider EP lookups
+    g_ort.module = ort_mod;  // keep handle for _try_provider EP lookups
     api = _ort_api_from_module(ort_mod, ort_override);
   }
 #ifdef ORT_LAZY_LOAD
@@ -841,8 +902,10 @@ static gpointer _init_ort_api(gpointer data)
   {
     // Windows/macOS: use the directly linked ORT library (DirectML/CoreML).
     const OrtApiBase *base = OrtGetApiBase();
-    dt_print(DT_DEBUG_AI, "[darktable_ai] loaded ORT %s (bundled)",
-             base->GetVersionString());
+    const char *bundled_version = base->GetVersionString();
+    g_free(g_ort.version);
+    g_ort.version = g_strdup(bundled_version ? bundled_version : "unknown");
+    dt_print(DT_DEBUG_AI, "[darktable_ai] loaded ORT %s (bundled)", bundled_version);
     api = base->GetApi(ORT_API_VERSION);
   }
 #endif
@@ -855,7 +918,7 @@ done:
   }
   else
   {
-    g_ort = api;
+    g_ort.api = api;
     gchar *prov_str = dt_conf_get_string(DT_AI_CONF_PROVIDER);
     dt_print(DT_DEBUG_AI, "[darktable_ai] execution provider: %s",
              prov_str && prov_str[0] ? prov_str : "auto");
@@ -869,18 +932,18 @@ done:
 // just lists statically-linked / loadable providers, it does not load them
 static gboolean _ort_has_provider(const char *name)
 {
-  if(!g_ort || !g_ort->GetAvailableProviders) return FALSE;
+  if(!g_ort.api || !g_ort.api->GetAvailableProviders) return FALSE;
   char **providers = NULL;
   int n = 0;
-  if(g_ort->GetAvailableProviders(&providers, &n) != NULL || !providers)
+  if(g_ort.api->GetAvailableProviders(&providers, &n) != NULL || !providers)
     return FALSE;
   gboolean found = FALSE;
   for(int i = 0; i < n && !found; i++)
     if(g_strcmp0(providers[i], name) == 0) found = TRUE;
-  if(g_ort->ReleaseAvailableProviders)
+  if(g_ort.api->ReleaseAvailableProviders)
   {
-    OrtStatus *rs = g_ort->ReleaseAvailableProviders(providers, n);
-    if(rs) g_ort->ReleaseStatus(rs);
+    OrtStatus *rs = g_ort.api->ReleaseAvailableProviders(providers, n);
+    if(rs) g_ort.api->ReleaseStatus(rs);
   }
   return found;
 }
@@ -906,22 +969,32 @@ static void _setup_amd_caches(void)
   if(!_ort_has_provider("MIGraphXExecutionProvider"))
     return;
 
-  char cachedir[PATH_MAX] = { 0 };
-  dt_loc_get_user_cache_dir(cachedir, sizeof(cachedir));
+  const int dev = _device_id_from_conf("plugins/ai/migraphx_device_id",
+                                       "DT_MIGRAPHX_DEVICE_ID");
+  gchar *fp = _backend_cache_fingerprint(DT_AI_PROVIDER_MIGRAPHX, dev);
 
-  gchar *miopen_dir = g_build_filename(cachedir, "ai", "amd", "miopen", NULL);
-  g_mkdir_with_parents(miopen_dir, 0700);
-  g_setenv("MIOPEN_USER_DB_PATH", miopen_dir, FALSE);
-  g_setenv("MIOPEN_CUSTOM_CACHE_DIR", miopen_dir, FALSE);
-  dt_print(DT_DEBUG_AI, "[darktable_ai] MIOpen cache: %s", miopen_dir);
-  g_free(miopen_dir);
+  // two independent sub-caches (MIOpen kernel DB + MIGraphX engine
+  // cache). reserved model-id names "_miopen" / "_migraphx" give each
+  // its own subdir; invalidate-by-model never matches these because
+  // real model_ids don't start with underscore
+  char miopen_dir[PATH_MAX] = { 0 };
+  if(dt_ai_backend_cache_dir(DT_AI_PROVIDER_MIGRAPHX, fp,
+                             "_miopen", miopen_dir, sizeof(miopen_dir)))
+  {
+    g_setenv("MIOPEN_USER_DB_PATH", miopen_dir, FALSE);
+    g_setenv("MIOPEN_CUSTOM_CACHE_DIR", miopen_dir, FALSE);
+    dt_print(DT_DEBUG_AI, "[darktable_ai] MIOpen cache: %s", miopen_dir);
+  }
 
-  gchar *migraphx_dir = g_build_filename(cachedir, "ai", "amd", "migraphx", NULL);
-  g_mkdir_with_parents(migraphx_dir, 0700);
-  g_setenv("ORT_MIGRAPHX_CACHE_PATH", migraphx_dir, FALSE);
-  g_setenv("ORT_MIGRAPHX_MODEL_CACHE_PATH", migraphx_dir, FALSE);
-  dt_print(DT_DEBUG_AI, "[darktable_ai] MIGraphX cache: %s", migraphx_dir);
-  g_free(migraphx_dir);
+  char migraphx_dir[PATH_MAX] = { 0 };
+  if(dt_ai_backend_cache_dir(DT_AI_PROVIDER_MIGRAPHX, fp,
+                             "_migraphx", migraphx_dir, sizeof(migraphx_dir)))
+  {
+    g_setenv("ORT_MIGRAPHX_CACHE_PATH", migraphx_dir, FALSE);
+    g_setenv("ORT_MIGRAPHX_MODEL_CACHE_PATH", migraphx_dir, FALSE);
+    dt_print(DT_DEBUG_AI, "[darktable_ai] MIGraphX cache: %s", migraphx_dir);
+  }
+  g_free(fp);
 }
 #endif
 
@@ -934,33 +1007,34 @@ static void _setup_amd_caches(void)
 static gboolean _try_openvino_with_cache(OrtSessionOptions *session_opts)
 {
   if(!_ort_has_provider("OpenVINOExecutionProvider")
-     || !g_ort->SessionOptionsAppendExecutionProvider_OpenVINO_V2)
+     || !g_ort.api->SessionOptionsAppendExecutionProvider_OpenVINO_V2)
     return FALSE;
 
-  char cachedir[PATH_MAX] = { 0 };
-  dt_loc_get_user_cache_dir(cachedir, sizeof(cachedir));
-  gchar *ov_dir = g_build_filename(cachedir, "ai", "intel", "openvino", NULL);
-  g_mkdir_with_parents(ov_dir, 0700);
+  // process-global (no per-model id at session-creation time)
+  gchar *fp = _backend_cache_fingerprint(DT_AI_PROVIDER_OPENVINO, -1);
+  char ov_dir[PATH_MAX] = { 0 };
+  const gboolean ok = dt_ai_backend_cache_dir(
+    DT_AI_PROVIDER_OPENVINO, fp, "_shared", ov_dir, sizeof(ov_dir));
+  g_free(fp);
+  if(!ok) return FALSE;
 
   dt_print(DT_DEBUG_AI,
            "[darktable_ai] attempting Intel OpenVINO (cache: %s)...", ov_dir);
 
   const char *keys[] = { "device_type", "cache_dir" };
   const char *values[] = { "AUTO", ov_dir };
-  OrtStatus *status = g_ort->SessionOptionsAppendExecutionProvider_OpenVINO_V2(
+  OrtStatus *status = g_ort.api->SessionOptionsAppendExecutionProvider_OpenVINO_V2(
     session_opts, keys, values, 2);
 
   if(status)
   {
     dt_print(DT_DEBUG_AI,
              "[darktable_ai] OpenVINO (with cache) failed: %s",
-             g_ort->GetErrorMessage(status));
-    g_ort->ReleaseStatus(status);
-    g_free(ov_dir);
+             g_ort.api->GetErrorMessage(status));
+    g_ort.api->ReleaseStatus(status);
     return FALSE;
   }
   dt_print(DT_DEBUG_AI, "[darktable_ai] Intel OpenVINO enabled with disk cache.");
-  g_free(ov_dir);
   return TRUE;
 }
 
@@ -975,7 +1049,7 @@ static gpointer _init_ort_env(gpointer data)
   // ORT may emit additional schema-registration noise during env creation.
   const int saved = _stderr_suppress_begin();
 #endif
-  OrtStatus *status = g_ort->CreateEnv(ORT_LOGGING_LEVEL_WARNING, "DarktableAI", &env);
+  OrtStatus *status = g_ort.api->CreateEnv(ORT_LOGGING_LEVEL_WARNING, "DarktableAI", &env);
 #ifdef ORT_LAZY_LOAD
   _stderr_suppress_end(saved);
 #endif
@@ -983,11 +1057,11 @@ static gpointer _init_ort_env(gpointer data)
   {
     dt_print(DT_DEBUG_AI,
              "[darktable_ai] failed to create ORT environment: %s",
-             g_ort->GetErrorMessage(status));
-    g_ort->ReleaseStatus(status);
+             g_ort.api->GetErrorMessage(status));
+    g_ort.api->ReleaseStatus(status);
     return NULL;
   }
-  g_env = env;
+  g_ort.env = env;
   return (gpointer)env;
 }
 
@@ -1180,6 +1254,77 @@ static gchar *_lookup_device_name(const dt_ai_provider_t provider,
   return name;
 }
 
+// strip non-alphanumeric chars in place so the result is safe to embed
+// in a directory name
+static void _alnum_inplace(char *s)
+{
+  if(!s) return;
+  char *r = s, *w = s;
+  while(*r)
+  {
+    if(g_ascii_isalnum(*r)) *w++ = *r;
+    r++;
+  }
+  *w = '\0';
+}
+
+// hardware fingerprint for the per-EP cache subdir. for device-aware
+// EPs (CUDA/DirectML/MIGraphX) the fingerprint is the alphanumeric
+// device name so different GPUs get different cache slots.
+// driver-version is left out for now; bump DT_AI_CACHE_SCHEMA if the
+// compiled-artifact format ever changes incompatibly
+static gchar *_backend_cache_fingerprint(dt_ai_provider_t provider,
+                                         int device_id)
+{
+  gchar *base = NULL;
+  switch(provider)
+  {
+    case DT_AI_PROVIDER_COREML:
+#if defined(__aarch64__) || defined(__arm64__)
+      base = g_strdup("arm64");
+#elif defined(__x86_64__) || defined(_M_X64)
+      base = g_strdup("x86_64");
+#else
+      base = g_strdup("default");
+#endif
+      break;
+
+    case DT_AI_PROVIDER_OPENVINO:
+      // OpenVINO uses device_type="AUTO" everywhere we call it; no
+      // per-device id concept at the session level
+      base = g_strdup("auto");
+      break;
+
+    case DT_AI_PROVIDER_CUDA:
+    case DT_AI_PROVIDER_DIRECTML:
+    case DT_AI_PROVIDER_MIGRAPHX:
+    {
+      gchar *name = _lookup_device_name(provider, device_id);
+      if(name) _alnum_inplace(name);
+      if(name && name[0])
+        base = name;  // ownership transfers to base
+      else
+      {
+        g_free(name);
+        base = g_strdup("default");
+      }
+      break;
+    }
+
+    default:
+      base = g_strdup("default");
+      break;
+  }
+
+  // suffix ORT version so an upgrade invalidates stale artifacts
+  gchar *ort = g_ort.version ? g_strdup(g_ort.version) : g_strdup("ortunknown");
+  _alnum_inplace(ort);
+  gchar *full = g_strdup_printf("%s_ort%s", base, ort);
+  g_free(base);
+  g_free(ort);
+  return full;
+}
+
 // try to find and call an ORT execution provider function at runtime via
 // dynamic symbol lookup (GModule/dlsym).  returns TRUE if the provider was
 // enabled successfully, FALSE otherwise.
@@ -1202,9 +1347,9 @@ static gboolean _try_provider(OrtSessionOptions *session_opts,
   void *func_ptr = NULL;
   // if a custom ORT library was loaded (e.g. CUDA build), look up the
   // EP symbol there — the bundled DirectML onnxruntime.dll won't have it
-  if(g_ort_module)
+  if(g_ort.module)
   {
-    g_module_symbol(g_ort_module, symbol_name, &func_ptr);
+    g_module_symbol(g_ort.module, symbol_name, &func_ptr);
   }
   if(!func_ptr)
   {
@@ -1259,8 +1404,8 @@ static gboolean _try_provider(OrtSessionOptions *session_opts,
     {
       dt_print(DT_DEBUG_AI,
                "[darktable_ai] %s enable failed: %s",
-               provider_name, g_ort->GetErrorMessage(status));
-      g_ort->ReleaseStatus(status);
+               provider_name, g_ort.api->GetErrorMessage(status));
+      g_ort.api->ReleaseStatus(status);
     }
   }
   else
@@ -1275,6 +1420,50 @@ static gboolean _try_provider(OrtSessionOptions *session_opts,
 
   return ok;
 }
+
+#if defined(__APPLE__)
+// V2 keyed-options attach for CoreML. translates ep_flags into named
+// options and wires ModelCacheDirectory for persistent compile cache
+static gboolean _try_coreml_v2(OrtSessionOptions *session_opts,
+                               uint32_t ep_flags,
+                               const char *cache_dir)
+{
+  if(!g_ort.api || !g_ort.api->SessionOptionsAppendExecutionProvider) return FALSE;
+
+  const char *keys[8];
+  const char *vals[8];
+  size_t n = 0;
+
+  keys[n] = "ModelFormat";
+  vals[n] = (ep_flags & 16) ? "MLProgram" : "NeuralNetwork";
+  n++;
+
+  keys[n] = "MLComputeUnits";
+  vals[n] = (ep_flags & 1) ? "CPUOnly" : "ALL";
+  n++;
+
+  if(cache_dir && cache_dir[0])
+  {
+    keys[n] = "ModelCacheDirectory";
+    vals[n] = cache_dir;
+    n++;
+  }
+
+  dt_print(DT_DEBUG_AI, "[darktable_ai] attempting to enable Apple CoreML (V2)...");
+  OrtStatus *status = g_ort.api->SessionOptionsAppendExecutionProvider(
+    session_opts, "CoreML", keys, vals, n);
+  if(status)
+  {
+    dt_print(DT_DEBUG_AI,
+             "[darktable_ai] Apple CoreML (V2) enable failed: %s",
+             g_ort.api->GetErrorMessage(status));
+    g_ort.api->ReleaseStatus(status);
+    return FALSE;
+  }
+  dt_print(DT_DEBUG_AI, "[darktable_ai] Apple CoreML (V2) enabled successfully.");
+  return TRUE;
+}
+#endif  // __APPLE__
 
 // pick a GPU device_id: env var wins, then conf, fallback to 0.
 // each multi-GPU-capable EP has its own conf key + env var so users
@@ -1295,6 +1484,137 @@ static int _device_id_from_conf(const char *conf_key, const char *env_var)
   return 0;
 }
 
+// query total VRAM for a CUDA device via nvidia-smi, cached per device.
+// returns 0 on failure
+G_LOCK_DEFINE_STATIC(cuda_vram_cache);
+static size_t _cuda_total_vram_bytes(int device_id)
+{
+  static size_t cached[DT_AI_MAX_CUDA_DEVICES] = { 0 };
+  static gboolean queried[DT_AI_MAX_CUDA_DEVICES] = { FALSE };
+  if(device_id < 0 || device_id >= DT_AI_MAX_CUDA_DEVICES) return 0;
+
+  G_LOCK(cuda_vram_cache);
+  if(queried[device_id])
+  {
+    const size_t hit = cached[device_id];
+    G_UNLOCK(cuda_vram_cache);
+    return hit;
+  }
+  G_UNLOCK(cuda_vram_cache);
+
+  gchar *cmd = g_strdup_printf(
+    "nvidia-smi --query-gpu=memory.total "
+    "--format=csv,noheader,nounits -i %d", device_id);
+  gchar *out = _run_capture(cmd);
+  g_free(cmd);
+
+  size_t bytes = 0;
+  if(out)
+  {
+    const long mb = atol(g_strstrip(out));
+    if(mb > 0) bytes = (size_t)mb * 1024UL * 1024UL;
+    g_free(out);
+  }
+
+  G_LOCK(cuda_vram_cache);
+  cached[device_id] = bytes;
+  queried[device_id] = TRUE;
+  G_UNLOCK(cuda_vram_cache);
+  return bytes;
+}
+
+// gpu_mem_limit (bytes) for CUDA EP. precedence:
+//   env DT_CUDA_MEM_LIMIT_MB > conf plugins/ai/cuda_mem_limit_mb > 75% VRAM.
+// returns 0 = no cap
+static size_t _cuda_mem_limit_bytes(int device_id)
+{
+  const char *env = g_getenv("DT_CUDA_MEM_LIMIT_MB");
+  if(env && env[0])
+  {
+    const long mb = atol(env);
+    if(mb > 0) return (size_t)mb * 1024UL * 1024UL;
+  }
+  if(dt_conf_key_exists("plugins/ai/cuda_mem_limit_mb"))
+  {
+    const int mb = dt_conf_get_int("plugins/ai/cuda_mem_limit_mb");
+    if(mb > 0) return (size_t)mb * 1024UL * 1024UL;
+  }
+  const size_t total = _cuda_total_vram_bytes(device_id);
+  if(total == 0) return 0;
+  return total - total / 4;
+}
+
+// configure CUDA EP via V2 options API. HEURISTIC algo search and
+// kSameAsRequested arena avoid a per-Run VRAM leak observed on Blackwell
+// (large cuDNN workspaces not returning to the arena between Runs).
+// returns FALSE if V2 setup fails so callers can fall back to V1
+static gboolean _try_cuda_v2(OrtSessionOptions *session_opts, int device_id)
+{
+  if(!g_ort.api
+     || !g_ort.api->CreateCUDAProviderOptions
+     || !g_ort.api->UpdateCUDAProviderOptions
+     || !g_ort.api->SessionOptionsAppendExecutionProvider_CUDA_V2
+     || !g_ort.api->ReleaseCUDAProviderOptions)
+    return FALSE;
+
+#if defined(__linux__)
+  if(!_check_cuda_driver_compat()) return FALSE;
+#endif
+
+  dt_print(DT_DEBUG_AI, "[darktable_ai] attempting to enable NVIDIA CUDA (V2)...");
+
+  OrtCUDAProviderOptionsV2 *opts = NULL;
+  OrtStatus *st = g_ort.api->CreateCUDAProviderOptions(&opts);
+  if(st)
+  {
+    g_ort.api->ReleaseStatus(st);
+    return FALSE;
+  }
+
+  const size_t cap = _cuda_mem_limit_bytes(device_id);
+  gchar *dev_str = g_strdup_printf("%d", device_id);
+  gchar *cap_str = cap ? g_strdup_printf("%zu", cap) : NULL;
+
+  const char *keys[4];
+  const char *vals[4];
+  int n = 0;
+  keys[n] = "device_id";                vals[n++] = dev_str;
+  keys[n] = "arena_extend_strategy";    vals[n++] = "kSameAsRequested";
+  keys[n] = "cudnn_conv_algo_search";   vals[n++] = "HEURISTIC";
+  if(cap_str) { keys[n] = "gpu_mem_limit"; vals[n++] = cap_str; }
+
+  st = g_ort.api->UpdateCUDAProviderOptions(opts, keys, vals, n);
+  g_free(dev_str);
+  g_free(cap_str);
+  if(st)
+  {
+    dt_print(DT_DEBUG_AI, "[darktable_ai] CUDA V2 UpdateOptions failed: %s",
+             g_ort.api->GetErrorMessage(st));
+    g_ort.api->ReleaseStatus(st);
+    g_ort.api->ReleaseCUDAProviderOptions(opts);
+    return FALSE;
+  }
+
+  st = g_ort.api->SessionOptionsAppendExecutionProvider_CUDA_V2(session_opts, opts);
+  g_ort.api->ReleaseCUDAProviderOptions(opts);
+  if(st)
+  {
+    dt_print(DT_DEBUG_AI, "[darktable_ai] CUDA V2 append failed: %s",
+             g_ort.api->GetErrorMessage(st));
+    g_ort.api->ReleaseStatus(st);
+    return FALSE;
+  }
+
+  gchar *dev_name = _lookup_device_name(DT_AI_PROVIDER_CUDA, device_id);
+  dt_print(DT_DEBUG_AI,
+           "[darktable_ai] NVIDIA CUDA enabled successfully on device %d: %s "
+           "(mem_limit=%zu MB, algo=HEURISTIC, arena=kSameAsRequested)",
+           device_id, dev_name ? dev_name : "?",
+           cap ? cap / (1024UL * 1024UL) : 0);
+  g_free(dev_name);
+  return TRUE;
+}
+
 static void
 _enable_acceleration(OrtSessionOptions *session_opts,
                      dt_ai_provider_t provider,
@@ -1309,10 +1629,23 @@ _enable_acceleration(OrtSessionOptions *session_opts,
 
   case DT_AI_PROVIDER_COREML:
 #if defined(__APPLE__)
-    _try_provider(
-      session_opts,
-      "OrtSessionOptionsAppendExecutionProvider_CoreML",
-      "Apple CoreML", NULL, coreml_flags, DT_AI_PROVIDER_COREML);
+  {
+    dt_print(DT_DEBUG_AI,
+             "[darktable_ai] CoreML format: %s%s",
+             (coreml_flags & 16) ? "MLProgram" : "NeuralNetwork",
+             (coreml_flags & 1) ? " (CPU compute units)" : "");
+    gchar *fp = _backend_cache_fingerprint(DT_AI_PROVIDER_COREML, -1);
+    char coreml_cache[PATH_MAX] = { 0 };
+    const gboolean have_cache = dt_ai_backend_cache_dir(
+      DT_AI_PROVIDER_COREML, fp, "_shared", coreml_cache, sizeof(coreml_cache));
+    g_free(fp);
+    if(!_try_coreml_v2(session_opts, coreml_flags,
+                       have_cache ? coreml_cache : NULL))
+      _try_provider(
+        session_opts,
+        "OrtSessionOptionsAppendExecutionProvider_CoreML",
+        "Apple CoreML", NULL, coreml_flags, DT_AI_PROVIDER_COREML);
+  }
 #else
     dt_print(DT_DEBUG_AI, "[darktable_ai] apple CoreML not available on this platform");
 #endif
@@ -1322,8 +1655,9 @@ _enable_acceleration(OrtSessionOptions *session_opts,
   {
     const int dev = _device_id_from_conf("plugins/ai/cuda_device_id",
                                          "DT_CUDA_DEVICE_ID");
-    _try_provider(session_opts, "OrtSessionOptionsAppendExecutionProvider_CUDA",
-                  "NVIDIA CUDA", NULL, (uint32_t)dev, DT_AI_PROVIDER_CUDA);
+    if(!_try_cuda_v2(session_opts, dev))
+      _try_provider(session_opts, "OrtSessionOptionsAppendExecutionProvider_CUDA",
+                    "NVIDIA CUDA", NULL, (uint32_t)dev, DT_AI_PROVIDER_CUDA);
     break;
   }
 
@@ -1364,43 +1698,11 @@ _enable_acceleration(OrtSessionOptions *session_opts,
 
   case DT_AI_PROVIDER_AUTO:
   default:
-    // auto-detect best provider based on platform
-#if defined(__APPLE__)
-    _try_provider(
-      session_opts,
-      "OrtSessionOptionsAppendExecutionProvider_CoreML",
-      "Apple CoreML", NULL, coreml_flags, DT_AI_PROVIDER_COREML);
-#elif defined(_WIN32)
-    {
-      const int dev = _device_id_from_conf("plugins/ai/dml_device_id",
-                                           "DT_DML_DEVICE_ID");
-      _try_provider(session_opts,
-                    "OrtSessionOptionsAppendExecutionProvider_DML",
-                    "Windows DirectML", NULL, (uint32_t)dev, DT_AI_PROVIDER_DIRECTML);
-    }
-#elif defined(__linux__)
-    // try CUDA first, then MIGraphX (cache configured at env init)
-    {
-      const int cuda_dev = _device_id_from_conf("plugins/ai/cuda_device_id",
-                                                "DT_CUDA_DEVICE_ID");
-      const int amd_dev  = _device_id_from_conf("plugins/ai/migraphx_device_id",
-                                                "DT_MIGRAPHX_DEVICE_ID");
-      if(!_try_provider(
-           session_opts,
-           "OrtSessionOptionsAppendExecutionProvider_CUDA",
-           "NVIDIA CUDA", NULL, (uint32_t)cuda_dev, DT_AI_PROVIDER_CUDA))
-      {
-        if(!_try_provider(
-             session_opts,
-             "OrtSessionOptionsAppendExecutionProvider_MIGraphX",
-             "AMD MIGraphX", NULL, (uint32_t)amd_dev, DT_AI_PROVIDER_MIGRAPHX))
-          _try_provider(
-            session_opts,
-            "OrtSessionOptionsAppendExecutionProvider_ROCM",
-            "AMD ROCm (legacy)", NULL, (uint32_t)amd_dev, DT_AI_PROVIDER_MIGRAPHX);
-      }
-    }
-#endif
+    // unreachable: dt_ai_load_model_ext resolves AUTO/CONFIGURED to a
+    // concrete EP before this point. log and fall through to CPU
+    dt_print(DT_DEBUG_AI,
+             "[darktable_ai] unexpected provider %d at _enable_acceleration "
+             "— falling back to CPU", provider);
     break;
   }
 }
@@ -1417,19 +1719,31 @@ int dt_ai_probe_provider(dt_ai_provider_t provider)
   if(!dt_conf_get_bool("plugins/ai/enabled"))
     return 0;
 
-  // ensure ORT API is initialized
-  g_once(&g_ort_once, _init_ort_api, NULL);
-  if(!g_ort) return 0;
+  // memoize the result per EP. ORT availability doesn't change within
+  // a process (lib loads once at startup), so a real attach is needed
+  // only on the first call. -1 = unknown, 0 = no, 1 = yes. atomic
+  // access avoids racing concurrent first-callers; the worst case is
+  // two threads both probing — both reach the same answer, both store
+  static gint s_cache[DT_AI_PROVIDER_COUNT] = { -1, -1, -1, -1, -1, -1, -1 };
+  if(provider < DT_AI_PROVIDER_COUNT)
+  {
+    const gint cached = g_atomic_int_get(&s_cache[provider]);
+    if(cached >= 0) return cached;
+  }
 
-  g_once(&g_env_once, _init_ort_env, NULL);
-  if(!g_env) return 0;
+  // ensure ORT API is initialized
+  g_once(&g_ort.api_once, _init_ort_api, NULL);
+  if(!g_ort.api) return 0;
+
+  g_once(&g_ort.env_once, _init_ort_env, NULL);
+  if(!g_ort.env) return 0;
 
   // create temporary session options for the probe
   OrtSessionOptions *opts = NULL;
-  OrtStatus *status = g_ort->CreateSessionOptions(&opts);
+  OrtStatus *status = g_ort.api->CreateSessionOptions(&opts);
   if(status)
   {
-    g_ort->ReleaseStatus(status);
+    g_ort.api->ReleaseStatus(status);
     return 0;
   }
 
@@ -1475,8 +1789,11 @@ int dt_ai_probe_provider(dt_ai_provider_t provider)
     break;
   }
 
-  g_ort->ReleaseSessionOptions(opts);
-  return ok ? 1 : 0;
+  g_ort.api->ReleaseSessionOptions(opts);
+  const int result = ok ? 1 : 0;
+  if(provider < DT_AI_PROVIDER_COUNT)
+    g_atomic_int_set(&s_cache[provider], result);
+  return result;
 }
 
 // ONNX Model Loading
@@ -1502,15 +1819,15 @@ dt_ai_onnx_load_ext(const char *model_dir, const char *model_file,
   }
 
   // lazy init ORT API and shared environment on first load
-  g_once(&g_ort_once, _init_ort_api, NULL);
-  if(!g_ort)
+  g_once(&g_ort.api_once, _init_ort_api, NULL);
+  if(!g_ort.api)
   {
     g_free(onnx_path);
     return NULL;
   }
 
-  g_once(&g_env_once, _init_ort_env, NULL);
-  if(!g_env)
+  g_once(&g_ort.env_once, _init_ort_env, NULL);
+  if(!g_ort.env)
   {
     g_free(onnx_path);
     return NULL;
@@ -1522,21 +1839,21 @@ dt_ai_onnx_load_ext(const char *model_dir, const char *model_file,
 
   OrtStatus *status;
   OrtSessionOptions *session_opts;
-  status = g_ort->CreateSessionOptions(&session_opts);
+  status = g_ort.api->CreateSessionOptions(&session_opts);
   if(status)
   {
-    g_ort->ReleaseStatus(status);
+    g_ort.api->ReleaseStatus(status);
     g_free(onnx_path);
     dt_ai_unload_model(ctx);
     return NULL;
   }
 
   // let ORT auto-select thread count (pass 0)
-  status = g_ort->SetIntraOpNumThreads(session_opts, 0);
+  status = g_ort.api->SetIntraOpNumThreads(session_opts, 0);
   if(status)
   {
-    g_ort->ReleaseStatus(status);
-    g_ort->ReleaseSessionOptions(session_opts);
+    g_ort.api->ReleaseStatus(status);
+    g_ort.api->ReleaseSessionOptions(session_opts);
     g_free(onnx_path);
     dt_ai_unload_model(ctx);
     return NULL;
@@ -1546,11 +1863,11 @@ dt_ai_onnx_load_ext(const char *model_dir, const char *model_file,
     = (opt_level == DT_AI_OPT_DISABLED) ? ORT_DISABLE_ALL
     : (opt_level == DT_AI_OPT_BASIC)    ? ORT_ENABLE_BASIC
                                          : ORT_ENABLE_ALL;
-  status = g_ort->SetSessionGraphOptimizationLevel(session_opts, ort_opt);
+  status = g_ort.api->SetSessionGraphOptimizationLevel(session_opts, ort_opt);
   if(status)
   {
-    g_ort->ReleaseStatus(status);
-    g_ort->ReleaseSessionOptions(session_opts);
+    g_ort.api->ReleaseStatus(status);
+    g_ort.api->ReleaseSessionOptions(session_opts);
     g_free(onnx_path);
     dt_ai_unload_model(ctx);
     return NULL;
@@ -1560,14 +1877,14 @@ dt_ai_onnx_load_ext(const char *model_dir, const char *model_file,
   for(int i = 0; i < n_overrides; i++)
   {
     if(!dim_overrides[i].name) continue;
-    status = g_ort->AddFreeDimensionOverrideByName(session_opts,
+    status = g_ort.api->AddFreeDimensionOverrideByName(session_opts,
                                                    dim_overrides[i].name,
                                                    dim_overrides[i].value);
     if(status)
     {
       dt_print(DT_DEBUG_AI, "[darktable_ai] dim override '%s' failed: %s",
-               dim_overrides[i].name, g_ort->GetErrorMessage(status));
-      g_ort->ReleaseStatus(status);
+               dim_overrides[i].name, g_ort.api->GetErrorMessage(status));
+      g_ort.api->ReleaseStatus(status);
     }
   }
 
@@ -1577,9 +1894,9 @@ dt_ai_onnx_load_ext(const char *model_dir, const char *model_file,
 #ifdef _WIN32
   // on windows, CreateSession expects a wide character string
   wchar_t *onnx_path_wide = (wchar_t *)g_utf8_to_utf16(onnx_path, -1, NULL, NULL, NULL);
-  status = g_ort->CreateSession(g_env, onnx_path_wide, session_opts, &ctx->session);
+  status = g_ort.api->CreateSession(g_ort.env, onnx_path_wide, session_opts, &ctx->session);
 #else
-  status = g_ort->CreateSession(g_env, onnx_path, session_opts, &ctx->session);
+  status = g_ort.api->CreateSession(g_ort.env, onnx_path, session_opts, &ctx->session);
 #endif
 
   // smart fallback: try progressively simpler configurations
@@ -1618,30 +1935,30 @@ dt_ai_onnx_load_ext(const char *model_dir, const char *model_file,
 
       dt_print(DT_DEBUG_AI,
                "[darktable_ai] session failed: %s - retrying with %s",
-               g_ort->GetErrorMessage(status), fallbacks[fb].desc);
-      g_ort->ReleaseStatus(status);
-      g_ort->ReleaseSessionOptions(session_opts);
+               g_ort.api->GetErrorMessage(status), fallbacks[fb].desc);
+      g_ort.api->ReleaseStatus(status);
+      g_ort.api->ReleaseSessionOptions(session_opts);
 
-      status = g_ort->CreateSessionOptions(&session_opts);
+      status = g_ort.api->CreateSessionOptions(&session_opts);
       if(status) break;
-      OrtStatus *s = g_ort->SetIntraOpNumThreads(session_opts, 0);
-      if(s) g_ort->ReleaseStatus(s);
-      s = g_ort->SetSessionGraphOptimizationLevel(session_opts, fallbacks[fb].opt);
-      if(s) g_ort->ReleaseStatus(s);
+      OrtStatus *s = g_ort.api->SetIntraOpNumThreads(session_opts, 0);
+      if(s) g_ort.api->ReleaseStatus(s);
+      s = g_ort.api->SetSessionGraphOptimizationLevel(session_opts, fallbacks[fb].opt);
+      if(s) g_ort.api->ReleaseStatus(s);
       for(int i = 0; i < n_overrides; i++)
       {
         if(!dim_overrides[i].name) continue;
-        s = g_ort->AddFreeDimensionOverrideByName(session_opts,
+        s = g_ort.api->AddFreeDimensionOverrideByName(session_opts,
                                                   dim_overrides[i].name,
                                                   dim_overrides[i].value);
-        if(s) g_ort->ReleaseStatus(s);
+        if(s) g_ort.api->ReleaseStatus(s);
       }
       if(fallbacks[fb].prov != DT_AI_PROVIDER_CPU)
         _enable_acceleration(session_opts, fallbacks[fb].prov, ep_flags);
 #ifdef _WIN32
-      status = g_ort->CreateSession(g_env, onnx_path_wide, session_opts, &ctx->session);
+      status = g_ort.api->CreateSession(g_ort.env, onnx_path_wide, session_opts, &ctx->session);
 #else
-      status = g_ort->CreateSession(g_env, onnx_path, session_opts, &ctx->session);
+      status = g_ort.api->CreateSession(g_ort.env, onnx_path, session_opts, &ctx->session);
 #endif
     }
   }
@@ -1649,49 +1966,49 @@ dt_ai_onnx_load_ext(const char *model_dir, const char *model_file,
 #ifdef _WIN32
   g_free(onnx_path_wide);
 #endif
-  g_ort->ReleaseSessionOptions(session_opts);
+  g_ort.api->ReleaseSessionOptions(session_opts);
   g_free(onnx_path);
 
   if(status)
   {
     dt_print(DT_DEBUG_AI,
              "[darktable_ai] failed to create session: %s",
-             g_ort->GetErrorMessage(status));
-    g_ort->ReleaseStatus(status);
+             g_ort.api->GetErrorMessage(status));
+    g_ort.api->ReleaseStatus(status);
     dt_ai_unload_model(ctx);
     return NULL;
   }
 
   status
-    = g_ort->CreateCpuMemoryInfo(OrtArenaAllocator, OrtMemTypeDefault, &ctx->memory_info);
+    = g_ort.api->CreateCpuMemoryInfo(OrtArenaAllocator, OrtMemTypeDefault, &ctx->memory_info);
   if(status)
   {
-    g_ort->ReleaseStatus(status);
+    g_ort.api->ReleaseStatus(status);
     dt_ai_unload_model(ctx);
     return NULL;
   }
 
   // resolve IO names
-  status = g_ort->GetAllocatorWithDefaultOptions(&ctx->allocator);
+  status = g_ort.api->GetAllocatorWithDefaultOptions(&ctx->allocator);
   if(status)
   {
-    g_ort->ReleaseStatus(status);
+    g_ort.api->ReleaseStatus(status);
     dt_ai_unload_model(ctx);
     return NULL;
   }
 
-  status = g_ort->SessionGetInputCount(ctx->session, &ctx->input_count);
+  status = g_ort.api->SessionGetInputCount(ctx->session, &ctx->input_count);
   if(status)
   {
-    g_ort->ReleaseStatus(status);
+    g_ort.api->ReleaseStatus(status);
     dt_ai_unload_model(ctx);
     return NULL;
   }
 
-  status = g_ort->SessionGetOutputCount(ctx->session, &ctx->output_count);
+  status = g_ort.api->SessionGetOutputCount(ctx->session, &ctx->output_count);
   if(status)
   {
-    g_ort->ReleaseStatus(status);
+    g_ort.api->ReleaseStatus(status);
     dt_ai_unload_model(ctx);
     return NULL;
   }
@@ -1701,38 +2018,38 @@ dt_ai_onnx_load_ext(const char *model_dir, const char *model_file,
   for(size_t i = 0; i < ctx->input_count; i++)
   {
     status
-      = g_ort->SessionGetInputName(ctx->session, i, ctx->allocator, &ctx->input_names[i]);
+      = g_ort.api->SessionGetInputName(ctx->session, i, ctx->allocator, &ctx->input_names[i]);
     if(status)
     {
-      g_ort->ReleaseStatus(status);
+      g_ort.api->ReleaseStatus(status);
       dt_ai_unload_model(ctx);
       return NULL;
     }
 
     // get input type
     OrtTypeInfo *typeinfo = NULL;
-    status = g_ort->SessionGetInputTypeInfo(ctx->session, i, &typeinfo);
+    status = g_ort.api->SessionGetInputTypeInfo(ctx->session, i, &typeinfo);
     if(status)
     {
-      g_ort->ReleaseStatus(status);
+      g_ort.api->ReleaseStatus(status);
       dt_ai_unload_model(ctx);
       return NULL;
     }
     const OrtTensorTypeAndShapeInfo *tensor_info = NULL;
-    status = g_ort->CastTypeInfoToTensorInfo(typeinfo, &tensor_info);
+    status = g_ort.api->CastTypeInfoToTensorInfo(typeinfo, &tensor_info);
     if(status)
     {
-      g_ort->ReleaseStatus(status);
-      g_ort->ReleaseTypeInfo(typeinfo);
+      g_ort.api->ReleaseStatus(status);
+      g_ort.api->ReleaseTypeInfo(typeinfo);
       dt_ai_unload_model(ctx);
       return NULL;
     }
     ONNXTensorElementDataType type;
-    status = g_ort->GetTensorElementType(tensor_info, &type);
+    status = g_ort.api->GetTensorElementType(tensor_info, &type);
     if(status)
     {
-      g_ort->ReleaseStatus(status);
-      g_ort->ReleaseTypeInfo(typeinfo);
+      g_ort.api->ReleaseStatus(status);
+      g_ort.api->ReleaseTypeInfo(typeinfo);
       dt_ai_unload_model(ctx);
       return NULL;
     }
@@ -1742,54 +2059,54 @@ dt_ai_onnx_load_ext(const char *model_dir, const char *model_file,
       dt_print(DT_DEBUG_AI,
                "[darktable_ai] unsupported ONNX input type %d for input %zu",
                type, i);
-      g_ort->ReleaseTypeInfo(typeinfo);
+      g_ort.api->ReleaseTypeInfo(typeinfo);
       dt_ai_unload_model(ctx);
       return NULL;
     }
 
-    g_ort->ReleaseTypeInfo(typeinfo);
+    g_ort.api->ReleaseTypeInfo(typeinfo);
   }
 
   ctx->output_names = g_new0(char *, ctx->output_count);
   ctx->output_types = g_new0(dt_ai_dtype_t, ctx->output_count);
   for(size_t i = 0; i < ctx->output_count; i++)
   {
-    status = g_ort->SessionGetOutputName(
+    status = g_ort.api->SessionGetOutputName(
       ctx->session,
       i,
       ctx->allocator,
       &ctx->output_names[i]);
     if(status)
     {
-      g_ort->ReleaseStatus(status);
+      g_ort.api->ReleaseStatus(status);
       dt_ai_unload_model(ctx);
       return NULL;
     }
 
     // get output type
     OrtTypeInfo *typeinfo = NULL;
-    status = g_ort->SessionGetOutputTypeInfo(ctx->session, i, &typeinfo);
+    status = g_ort.api->SessionGetOutputTypeInfo(ctx->session, i, &typeinfo);
     if(status)
     {
-      g_ort->ReleaseStatus(status);
+      g_ort.api->ReleaseStatus(status);
       dt_ai_unload_model(ctx);
       return NULL;
     }
     const OrtTensorTypeAndShapeInfo *tensor_info = NULL;
-    status = g_ort->CastTypeInfoToTensorInfo(typeinfo, &tensor_info);
+    status = g_ort.api->CastTypeInfoToTensorInfo(typeinfo, &tensor_info);
     if(status)
     {
-      g_ort->ReleaseStatus(status);
-      g_ort->ReleaseTypeInfo(typeinfo);
+      g_ort.api->ReleaseStatus(status);
+      g_ort.api->ReleaseTypeInfo(typeinfo);
       dt_ai_unload_model(ctx);
       return NULL;
     }
     ONNXTensorElementDataType type;
-    status = g_ort->GetTensorElementType(tensor_info, &type);
+    status = g_ort.api->GetTensorElementType(tensor_info, &type);
     if(status)
     {
-      g_ort->ReleaseStatus(status);
-      g_ort->ReleaseTypeInfo(typeinfo);
+      g_ort.api->ReleaseStatus(status);
+      g_ort.api->ReleaseTypeInfo(typeinfo);
       dt_ai_unload_model(ctx);
       return NULL;
     }
@@ -1799,12 +2116,12 @@ dt_ai_onnx_load_ext(const char *model_dir, const char *model_file,
       dt_print(DT_DEBUG_AI,
                "[darktable_ai] unsupported ONNX output type %d for output %zu",
                type, i);
-      g_ort->ReleaseTypeInfo(typeinfo);
+      g_ort.api->ReleaseTypeInfo(typeinfo);
       dt_ai_unload_model(ctx);
       return NULL;
     }
 
-    g_ort->ReleaseTypeInfo(typeinfo);
+    g_ort.api->ReleaseTypeInfo(typeinfo);
   }
 
   // detect dynamic output shapes (any dim <= 0 means symbolic/unknown).
@@ -1922,7 +2239,7 @@ int dt_ai_run(
       ret = -4;
       goto cleanup;
     }
-    status = g_ort->CreateTensorWithDataAsOrtValue(
+    status = g_ort.api->CreateTensorWithDataAsOrtValue(
       ctx->memory_info,
       data_ptr,
       element_count * type_size,
@@ -1935,8 +2252,8 @@ int dt_ai_run(
     {
       dt_print(DT_DEBUG_AI,
                "[darktable_ai] CreateTensor input[%d] fail: %s", 
-               i, g_ort->GetErrorMessage(status));
-      g_ort->ReleaseStatus(status);
+               i, g_ort.api->GetErrorMessage(status));
+      g_ort.api->ReleaseStatus(status);
       ret = -4;
       goto cleanup;
     }
@@ -1982,7 +2299,7 @@ int dt_ai_run(
       ret = -4;
       goto cleanup;
     }
-    status = g_ort->CreateTensorWithDataAsOrtValue(
+    status = g_ort.api->CreateTensorWithDataAsOrtValue(
       ctx->memory_info,
       outputs[i].data,
       element_count * type_size,
@@ -1995,15 +2312,15 @@ int dt_ai_run(
     {
       dt_print(DT_DEBUG_AI,
                "[darktable_ai] CreateTensor output[%d] fail: %s",
-               i, g_ort->GetErrorMessage(status));
-      g_ort->ReleaseStatus(status);
+               i, g_ort.api->GetErrorMessage(status));
+      g_ort.api->ReleaseStatus(status);
       ret = -4;
       goto cleanup;
     }
   }
 
   // run
-  status = g_ort->Run(ctx->session,
+  status = g_ort.api->Run(ctx->session,
                       NULL,
                       input_names,
                       (const OrtValue *const *)input_tensors,
@@ -2014,8 +2331,8 @@ int dt_ai_run(
 
   if(status)
   {
-    dt_print(DT_DEBUG_AI, "[darktable_ai] run error: %s", g_ort->GetErrorMessage(status));
-    g_ort->ReleaseStatus(status);
+    dt_print(DT_DEBUG_AI, "[darktable_ai] run error: %s", g_ort.api->GetErrorMessage(status));
+    g_ort.api->ReleaseStatus(status);
     ret = -3;
   }
   else
@@ -2031,13 +2348,13 @@ int dt_ai_run(
       if(!ort_allocated || !output_tensors[i]) continue;
 
       void *raw_data = NULL;
-      status = g_ort->GetTensorMutableData(output_tensors[i], &raw_data);
+      status = g_ort.api->GetTensorMutableData(output_tensors[i], &raw_data);
       if(status)
       {
         dt_print(DT_DEBUG_AI,
                  "[darktable_ai] GetTensorMutableData output[%d] failed: %s",
-                 i, g_ort->GetErrorMessage(status));
-        g_ort->ReleaseStatus(status);
+                 i, g_ort.api->GetErrorMessage(status));
+        g_ort.api->ReleaseStatus(status);
         continue;
       }
 
@@ -2045,37 +2362,37 @@ int dt_ai_run(
       // the caller's expected shape may differ from what ORT produced
       // (e.g., dynamic-shape models)
       OrtTensorTypeAndShapeInfo *tensor_info = NULL;
-      status = g_ort->GetTensorTypeAndShape(output_tensors[i], &tensor_info);
+      status = g_ort.api->GetTensorTypeAndShape(output_tensors[i], &tensor_info);
       if(status)
       {
         dt_print(DT_DEBUG_AI, "[darktable_ai] GetTensorTypeAndShape output[%d] failed: %s",
-                 i, g_ort->GetErrorMessage(status));
-        g_ort->ReleaseStatus(status);
+                 i, g_ort.api->GetErrorMessage(status));
+        g_ort.api->ReleaseStatus(status);
         continue;
       }
       // update caller's shape array with actual ORT output dimensions.
       // this is essential for dynamic-shape models where the caller's
       // pre-assumed shape may differ from what ORT actually produced.
       size_t actual_ndim = 0;
-      OrtStatus *dim_st = g_ort->GetDimensionsCount(tensor_info, &actual_ndim);
+      OrtStatus *dim_st = g_ort.api->GetDimensionsCount(tensor_info, &actual_ndim);
       if(!dim_st && actual_ndim > 0 && (int)actual_ndim <= outputs[i].ndim)
       {
-        OrtStatus *get_st = g_ort->GetDimensions(tensor_info, outputs[i].shape, actual_ndim);
+        OrtStatus *get_st = g_ort.api->GetDimensions(tensor_info, outputs[i].shape, actual_ndim);
         if(!get_st)
           outputs[i].ndim = (int)actual_ndim;
         else
-          g_ort->ReleaseStatus(get_st);
+          g_ort.api->ReleaseStatus(get_st);
       }
-      if(dim_st) g_ort->ReleaseStatus(dim_st);
+      if(dim_st) g_ort.api->ReleaseStatus(dim_st);
 
       size_t ort_element_count = 0;
-      status = g_ort->GetTensorShapeElementCount(tensor_info, &ort_element_count);
-      g_ort->ReleaseTensorTypeAndShapeInfo(tensor_info);
+      status = g_ort.api->GetTensorShapeElementCount(tensor_info, &ort_element_count);
+      g_ort.api->ReleaseTensorTypeAndShapeInfo(tensor_info);
       if(status)
       {
         dt_print(DT_DEBUG_AI, "[darktable_ai] GetTensorShapeElementCount output[%d] failed: %s",
-                 i, g_ort->GetErrorMessage(status));
-        g_ort->ReleaseStatus(status);
+                 i, g_ort.api->GetErrorMessage(status));
+        g_ort.api->ReleaseStatus(status);
         continue;
       }
 
@@ -2153,10 +2470,10 @@ cleanup:
   // cleanup OrtValues (wrappers only, data is owned by caller)
   for(int i = 0; i < num_inputs; i++)
     if(input_tensors[i])
-      g_ort->ReleaseValue(input_tensors[i]);
+      g_ort.api->ReleaseValue(input_tensors[i]);
   for(int i = 0; i < num_outputs; i++)
     if(output_tensors[i])
-      g_ort->ReleaseValue(output_tensors[i]);
+      g_ort.api->ReleaseValue(output_tensors[i]);
 
   // free temp input buffers
   for(int i = 0; i < num_inputs; i++)
@@ -2218,28 +2535,28 @@ int dt_ai_get_output_shape(dt_ai_context_t *ctx, int index,
     return -1;
 
   OrtTypeInfo *typeinfo = NULL;
-  OrtStatus *status = g_ort->SessionGetOutputTypeInfo(ctx->session, index, &typeinfo);
+  OrtStatus *status = g_ort.api->SessionGetOutputTypeInfo(ctx->session, index, &typeinfo);
   if(status)
   {
-    g_ort->ReleaseStatus(status);
+    g_ort.api->ReleaseStatus(status);
     return -1;
   }
 
   const OrtTensorTypeAndShapeInfo *tensor_info = NULL;
-  status = g_ort->CastTypeInfoToTensorInfo(typeinfo, &tensor_info);
+  status = g_ort.api->CastTypeInfoToTensorInfo(typeinfo, &tensor_info);
   if(status)
   {
-    g_ort->ReleaseStatus(status);
-    g_ort->ReleaseTypeInfo(typeinfo);
+    g_ort.api->ReleaseStatus(status);
+    g_ort.api->ReleaseTypeInfo(typeinfo);
     return -1;
   }
 
   size_t ndim = 0;
-  status = g_ort->GetDimensionsCount(tensor_info, &ndim);
+  status = g_ort.api->GetDimensionsCount(tensor_info, &ndim);
   if(status)
   {
-    g_ort->ReleaseStatus(status);
-    g_ort->ReleaseTypeInfo(typeinfo);
+    g_ort.api->ReleaseStatus(status);
+    g_ort.api->ReleaseTypeInfo(typeinfo);
     return -1;
   }
 
@@ -2247,15 +2564,15 @@ int dt_ai_get_output_shape(dt_ai_context_t *ctx, int index,
   int64_t full_shape[16];
   if(ndim > 16)
   {
-    g_ort->ReleaseTypeInfo(typeinfo);
+    g_ort.api->ReleaseTypeInfo(typeinfo);
     return -1;
   }
 
-  status = g_ort->GetDimensions(tensor_info, full_shape, ndim);
-  g_ort->ReleaseTypeInfo(typeinfo);
+  status = g_ort.api->GetDimensions(tensor_info, full_shape, ndim);
+  g_ort.api->ReleaseTypeInfo(typeinfo);
   if(status)
   {
-    g_ort->ReleaseStatus(status);
+    g_ort.api->ReleaseStatus(status);
     return -1;
   }
 
@@ -2268,10 +2585,10 @@ void dt_ai_unload_model(dt_ai_context_t *ctx)
   if(ctx)
   {
     if(ctx->session)
-      g_ort->ReleaseSession(ctx->session);
-    // note: OrtEnv is a shared singleton (g_env), not per-context
+      g_ort.api->ReleaseSession(ctx->session);
+    // note: OrtEnv is a shared singleton (g_ort.env), not per-context
     if(ctx->memory_info)
-      g_ort->ReleaseMemoryInfo(ctx->memory_info);
+      g_ort.api->ReleaseMemoryInfo(ctx->memory_info);
 
     // release IO names using the allocator that created them
     if(ctx->allocator)

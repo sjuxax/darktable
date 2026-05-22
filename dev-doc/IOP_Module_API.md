@@ -224,7 +224,7 @@ For most modules (those that don't change geometry), `roi_in` and `roi_out` are 
 
 ### Pipe Types (`dt_dev_pixelpipe_type_t`)
 
-Multiple pipelines may process an image simultaneously. Check `piece->pipe->type` when behavior should differ:
+Multiple pipelines may process an image simultaneously. Check `dt_pipe_is_full()` and friends when behavior should differ:
 
 ```c
 DT_DEV_PIXELPIPE_FULL       // Full-resolution center view
@@ -465,7 +465,14 @@ If the module can use the GPU, implement `process_cl()` wrapped in `#ifdef HAVE_
 
 ## Tiling Support
 
-If `IOP_FLAGS_ALLOW_TILING` is set, implement `tiling_callback()` to report memory requirements:
+If `IOP_FLAGS_ALLOW_TILING` is set, the pixelpipe is allowed to process a piece in tiling mode, if some parameters don't allow tiling override this in `commit_params()`.
+
+For calculation of memory requirements and tile aligning we have `tiling_callback()`, if not provided defaults are used as in `default_tiling_callback()`
+
+Whenever a module possibly exceeds requirements as defined in `default_tiling_callback()` or requires special aligning a specific `tiling_callback()` should be provided for three reasons:
+a) the tiling process will not allocate more memory than granted
+b) the OpenCL code path will not be tried if requirements are too high thus avoiding costly late fallbacks to CPU path.
+c) tile stitching will be correct for alignment
 
 | Field | Purpose |
 |-------|---------|
@@ -473,21 +480,22 @@ If `IOP_FLAGS_ALLOW_TILING` is set, implement `tiling_callback()` to report memo
 | `maxbuf` / `maxbuf_cl` | Largest single temporary buffer as a multiple of input size |
 | `overhead` | Fixed memory overhead in bytes |
 | `overlap` | Pixels of overlap between adjacent tiles (for spatial filters) |
-| `xalign` / `yalign` | Tile origin alignment (1 = none, 2 = Bayer pattern) |
+| `align` | Tile origin alignment (1 = none, other values only for special algorithms) |
 
+
+An example
 ```c
 void tiling_callback(dt_iop_module_t *self, dt_dev_pixelpipe_iop_t *piece,
                      const dt_iop_roi_t *roi_in, const dt_iop_roi_t *roi_out,
                      dt_develop_tiling_t *tiling)
 {
-  tiling->factor = 2.5f;     // input + 1.5× temp buffers
-  tiling->factor_cl = 2.5f;
+  tiling->factor = 2.5f;     // input + output + 2 single channel temp buffers
+  tiling->factor_cl = 3.75f; // as above but we need an additional rgb buffer plus a single channel buffer for a mask
   tiling->maxbuf = 1.0f;
   tiling->maxbuf_cl = 1.0f;
   tiling->overhead = 0;
   tiling->overlap = 4;       // 4-pixel overlap for a 3×3 kernel
-  tiling->xalign = 1;
-  tiling->yalign = 1;
+  tiling->align = 1;         // no special care for sensor patterns
 }
 ```
 

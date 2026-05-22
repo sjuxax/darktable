@@ -1310,8 +1310,8 @@ void dt_bauhaus_update_from_field(dt_iop_module_t *module,
            "[dt_bauhaus_update_from_field] invalid bauhaus widget type encountered");
     }
 
-    // if gui->reset then notebook tab highlights were not yet changed
-    if(!notebook && darktable.gui->reset
+    // if DT_IN_GUI_UPDATE() then notebook tab highlights were not yet changed
+    if(!notebook && DT_IN_GUI_UPDATE()
        && (notebook = gtk_widget_get_parent(widget))
        && (notebook = gtk_widget_get_parent(notebook))
        && !GTK_IS_NOTEBOOK(notebook))
@@ -1830,7 +1830,7 @@ static void _combobox_set(dt_bauhaus_widget_t *w,
     gtk_widget_queue_draw(bh->popup.window);
   }
 
-  if(!darktable.gui->reset && !mute)
+  if(!DT_IN_GUI_UPDATE() && !mute)
   {
     if(w->field)
     {
@@ -3431,7 +3431,7 @@ static void _slider_set_normalized(dt_bauhaus_widget_t *w, float pos)
   gtk_widget_queue_draw(GTK_WIDGET(w));
   if(darktable.bauhaus->current == w)
     gtk_widget_queue_draw(darktable.bauhaus->popup.area);
-  if(!darktable.gui->reset)
+  if(!DT_IN_GUI_UPDATE())
   {
     d->is_changed = -1;
     _slider_value_change(w);
@@ -3906,9 +3906,9 @@ static float _action_process_combo(gpointer target,
     case DT_ACTION_EFFECT_PREVIOUS:
       move_size *= - 1;
     case DT_ACTION_EFFECT_NEXT:
-      ++darktable.gui->reset;
+      DT_ENTER_GUI_UPDATE();
       _combobox_next_sensitive(w, move_size, GDK_MODIFIER_MASK, FALSE);
-      --darktable.gui->reset;
+      DT_LEAVE_GUI_UPDATE();
 
       g_idle_add(_combobox_idle_value_changed, widget);
       break;

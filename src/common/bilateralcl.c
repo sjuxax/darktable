@@ -148,7 +148,7 @@ dt_bilateral_cl_t *dt_bilateral_init_cl(const int devid,
 
 #if 0
   dt_print(DT_DEBUG_ALWAYS, "[bilateral] created grid [%d %d %d]"
-          " with sigma (%f %f) (%f %f)\n", b->size_x, b->size_y, b->size_z,
+          " with sigma (%f %f) (%f %f)", b->size_x, b->size_y, b->size_z,
           b->sigma_s, sigma_s, b->sigma_r, sigma_r);
 #endif
   return b;
@@ -200,7 +200,7 @@ cl_int dt_bilateral_slice_to_output_cl(dt_bilateral_cl_t *b, cl_mem in, cl_mem o
   cl_mem tmp = dt_opencl_alloc_device(b->devid, b->width, b->height, sizeof(float) * 4);
   if(tmp == NULL) goto error;
 
-  size_t region[] = { b->width, b->height };
+  const size_t region[2] = { b->width, b->height };
   err = dt_opencl_enqueue_copy_image(b->devid, out, tmp, CLIMG_ORIGIN, CLIMG_ORIGIN, region);
   if(err != CL_SUCCESS) goto error;
 

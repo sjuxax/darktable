@@ -82,6 +82,16 @@ guint dt_ai_providers_bundled(void);
  *  the snapshot is independent of when ORT is lazily initialized. */
 void dt_ai_snapshot_conf_state(void);
 
+/** Free heap-allocated backend globals (cached strings, conf snapshot).
+ *  Call once from dt_cleanup; OrtApi/OrtEnv/GModule are released through
+ *  their own paths (or leak at process exit, which is fine). */
+void dt_ai_backend_cleanup_globals(void);
+
+/** Read plugins/ai/models_path and expand ~ if present. Returns a
+ *  newly-allocated path, or NULL if the conf key is empty/unset.
+ *  Caller frees with g_free(). */
+gchar *dt_ai_resolve_models_path_override(void);
+
 /** TRUE if plugins/ai/ort_library_path differs from the value seen
  *  when ORT was loaded — the in-process ORT is stale, restart needed. */
 gboolean dt_ai_ort_path_changed_since_load(void);
@@ -184,6 +194,13 @@ typedef struct dt_ai_model_info_t {
   const char *backend;     ///< Backend type (e.g. "onnx")
   int num_inputs;          ///< Number of model inputs (default 1)
   const char *attributes;  ///< Optional attributes
+  const char *cpu_only;    ///< Top-level cpu_only block (JSON: array or object).
+                           ///< Consumed internally by the load function to
+                           ///< override the provider when the model declares
+                           ///< the configured EP unsafe.
+  const char *coreml_format; ///< CoreML model format (JSON: string or
+                             ///< stem-keyed object). "neuralnetwork"
+                             ///< (default) or "mlprogram".
 } dt_ai_model_info_t;
 
 /* --- Model "attributes" lookup ---
@@ -314,10 +331,18 @@ typedef struct {
  * @param env Library environment.
  * @param model_id ID of the model to load.
  * @param model_file Filename within the model directory (NULL = "model.onnx").
+ *                   When the model package declares per-file cpu_only entries,
+ *                   matching is done against this filename's stem (the
+ *                   basename minus the ".onnx" extension).
  * @param provider Execution provider (DT_AI_PROVIDER_CONFIGURED = use user config).
+ *                 The load function may override this to CPU when the model
+ *                 declares the configured GPU EP unsafe (see cpu_only attribute).
  * @param opt_level Graph optimization level.
  * @param dim_overrides Array of symbolic dimension overrides (NULL = none).
  * @param n_overrides Number of overrides.
+ * @param ep_flags EP-specific flag bitmask. Callers should pass 0; the
+ *                 load function adds bits internally based on the model's
+ *                 cpu_only declaration (e.g. COREML_FLAG_USE_CPU_ONLY).
  * @return dt_ai_context_t* Context ready for inference, or NULL.
  */
 dt_ai_context_t *dt_ai_load_model_ext(dt_ai_environment_t *env,
@@ -429,3 +454,23 @@ int dt_ai_get_output_shape(dt_ai_context_t *ctx, int index,
  * @param ctx The AI context to unload.
  */
 void dt_ai_unload_model(dt_ai_context_t *ctx);
+
+// compile-cache layout: <user_cache>/ai_v<SCHEMA>_<ep>_<fingerprint>/<model_id>/
+// bump SCHEMA when the layout changes incompatibly; old caches are skipped.
+#define DT_AI_CACHE_SCHEMA 1
+
+// build the compile-cache directory for (provider, fingerprint, model_id)
+// and mkdir -p it. pass model_id = "_shared" for caches without per-model
+// granularity. returns TRUE on success, FALSE on path overflow or mkdir failure.
+gboolean dt_ai_backend_cache_dir(dt_ai_provider_t provider,
+                                 const char *fingerprint,
+                                 const char *model_id,
+                                 char *out, size_t size);
+
+// remove every compile-cache subdir matching model_id across all providers
+// and schemas. called after a model is deleted or replaced.
+void dt_ai_backend_cache_invalidate(const char *model_id);
+
+// remove the entire compile-cache tree. exposed for a future user action;
+// not used internally.
+void dt_ai_backend_cache_invalidate_all(void);

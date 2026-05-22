@@ -633,7 +633,8 @@ dialog .sidebar row:selected:hover label,
 }
 
 #snapshot-button entry,
-#iop-module-name
+#iop-module-name,
+#lib-module-name
 {
   font-weight: lighter;
   font-family: sans-serif, "Arial Unicode MS";
@@ -2658,4 +2659,27 @@ popover *
 #tag-completion *:selected
 {
   background-color: @selected_bg_color;
+}
+
+/* log history popover */
+popover#log-history-popover scrolledwindow
+{
+  background-color: @bg_color;
+  border: none;
+}
+
+popover#log-history-popover row
+{
+  padding: 0;
+}
+
+popover#log-history-popover label
+{
+  color: @fg_color;
+}
+
+#log-history-popover overshoot,
+#log-history-popover undershoot
+{
+  all: unset;
 }

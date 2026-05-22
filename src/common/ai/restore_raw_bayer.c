@@ -230,6 +230,8 @@ static void _bayer_tile_geometry(const dt_restore_context_t *ctx,
                                  const _bayer_prep_t *prep,
                                  int sr0_base, int sc0_base,
                                  int width, int height,
+                                 int vis_y_lo, int vis_y_hi,
+                                 int vis_x_lo, int vis_x_hi,
                                  int *sr0_origin, int *sc0_origin,
                                  int *mir_y_lo, int *mir_y_hi,
                                  int *mir_x_lo, int *mir_x_hi)
@@ -241,13 +243,34 @@ static void _bayer_tile_geometry(const dt_restore_context_t *ctx,
   *sr0_origin = sr0_base + y0;
   *sc0_origin = sc0_base + x0;
 
+  // bound reflection by the visible region so OB rows past the visible
+  // edges don't leak into the model input and bias the gain match
+  int eff_y_lo = vis_y_lo;
+  int eff_y_hi = vis_y_hi;
+  int eff_x_lo = vis_x_lo;
+  int eff_x_hi = vis_x_hi;
+
   const gboolean cropped_mirror
     = ctx && force_rggb
       && ctx->edge_pad == DT_RESTORE_EDGE_MIRROR_CROPPED;
-  *mir_y_lo = cropped_mirror ? y0 : 0;
-  *mir_x_lo = cropped_mirror ? x0 : 0;
-  *mir_y_hi = cropped_mirror ? (height - (y0 ? 1 : 0)) : height;
-  *mir_x_hi = cropped_mirror ? (width  - (x0 ? 1 : 0)) : width;
+  if(cropped_mirror)
+  {
+    // shift to the CFA R origin so reflected 2x2 blocks align with RGGB
+    eff_y_lo += y0;
+    eff_x_lo += x0;
+    // keep the reflection span even so it stays CFA-aligned
+    if((eff_y_hi - eff_y_lo) & 1) eff_y_hi -= 1;
+    if((eff_x_hi - eff_x_lo) & 1) eff_x_hi -= 1;
+  }
+  if(eff_y_lo < 0) eff_y_lo = 0;
+  if(eff_x_lo < 0) eff_x_lo = 0;
+  if(eff_y_hi > height) eff_y_hi = height;
+  if(eff_x_hi > width)  eff_x_hi = width;
+
+  *mir_y_lo = eff_y_lo;
+  *mir_y_hi = eff_y_hi;
+  *mir_x_lo = eff_x_lo;
+  *mir_x_hi = eff_x_hi;
 }
 
 // sr0_origin / sc0_origin are sensor-space top-left coords of the packed
@@ -339,19 +362,23 @@ int dt_restore_raw_bayer(dt_restore_context_t *ctx,
     cfa_out[i] = (uint16_t)(cv + 0.5f);
   }
 
-  // working region in sensor coords: [y0..y0+2*Hh) x [x0..x0+2*Wh)
-  const int Hh = (height - y0) / 2;
-  const int Wh = (width - x0) / 2;
+  // working region in sensor coords: [y0..y0+2*Hh) x [x0..x0+2*Wh),
+  // bounded by the metadata-reported visible region
+  const int vis_x_lo  = (img->p_width  > 0) ? img->crop_x : 0;
+  const int vis_y_lo  = (img->p_height > 0) ? img->crop_y : 0;
+  const int vis_end_x = (img->p_width  > 0) ? (img->crop_x + img->p_width)  : width;
+  const int vis_end_y = (img->p_height > 0) ? (img->crop_y + img->p_height) : height;
+  const int Hh = (vis_end_y - y0) / 2;
+  const int Wh = (vis_end_x - x0) / 2;
   if(Hh <= 0 || Wh <= 0) return 0;  // too small; output == input
 
   // tile setup in packed (half-res) space
   const int O = OVERLAP_PACKED;
-  int T = dt_restore_get_tile_size(ctx);
-  if(T <= 2 * O) T = 256;  // defensive fallback
-
-retry:;
+  const int T = dt_restore_get_tile_size(ctx);
+  if(T <= 2 * O) return 1;
   const int step = T - 2 * O;
   if(step <= 0) return 1;
+  gboolean cpu_fallback_done = FALSE;
   const size_t tile_in_plane = (size_t)T * T;
   const size_t tile_out_w = 2 * (size_t)T;
   const size_t tile_out_plane = tile_out_w * tile_out_w;
@@ -360,10 +387,12 @@ retry:;
   const int total_tiles = cols * rows;
 
   dt_print(DT_DEBUG_AI,
-           "[restore_raw_bayer] %dx%d sensor (CFA origin %d,%d), "
-           "working %dx%d packed, tile T=%d, %dx%d grid (%d tiles)",
-           width, height, y0, x0, Wh, Hh,
-           T, cols, rows, total_tiles);
+           "[restore_raw_bayer] %dx%d sensor, visible %dx%d at (%d,%d), "
+           "CFA origin (%d,%d), working %dx%d packed, T=%d, "
+           "%dx%d grid (%d tiles)",
+           width, height, img->p_width, img->p_height,
+           img->crop_x, img->crop_y,
+           y0, x0, Wh, Hh, T, cols, rows, total_tiles);
 
   // diagnostic: raw CFA range and preprocessing params
   {
@@ -449,6 +478,7 @@ retry:;
       _bayer_tile_geometry(ctx, &prep,
                            2 * (py_base - O), 2 * (px_base - O),
                            width, height,
+                           vis_y_lo, vis_end_y, vis_x_lo, vis_end_x,
                            &sr0_origin, &sc0_origin,
                            &mir_y_lo, &mir_y_hi, &mir_x_lo, &mir_x_hi);
       _pack_bayer_tile(cfa_in, width, height,
@@ -481,19 +511,18 @@ retry:;
       // inference
       if(dt_restore_run_patch_bayer(ctx, tile_in, T, T, tile_out) != 0)
       {
-        // step down the ladder if possible. first tile only so we
-        // don't rewrite pixels we've already delivered
-        if(ty == 0 && tx == 0 && dt_restore_step_down_tile_size(ctx, &T))
+        // GPU failure on the first tile: retry once on CPU
+        if(tx == 0 && ty == 0 && !cpu_fallback_done
+           && dt_restore_reload_session_cpu(ctx))
         {
           dt_print(DT_DEBUG_AI,
-                   "[restore_raw_bayer] tile %d,%d failed, retrying at T=%d",
-                   tx, ty, T);
-          g_free(tile_in);
-          g_free(tile_out);
-          g_free(h_strip_top);
-          g_free(h_strip_bot);
-          g_free(v_strip_left);
-          goto retry;
+                   "[restore_raw_bayer] GPU inference failed; "
+                   "retrying on CPU");
+          dt_control_log(_("AI raw denoise: GPU inference failed, "
+                           "falling back to CPU"));
+          cpu_fallback_done = TRUE;
+          tx--;
+          continue;
         }
         dt_print(DT_DEBUG_AI,
                  "[restore_raw_bayer] inference failed at tile %d,%d (T=%d)",
@@ -734,8 +763,6 @@ retry:;
              (unsigned)omin, (unsigned)omax,
              n ? (double)osum / n : 0.0,
              black[0], white);
-
-    dt_restore_persist_tile_size(ctx);
   }
 
   return res;
@@ -780,29 +807,13 @@ int dt_restore_raw_bayer_preview_piped(dt_restore_context_t *ctx,
   crop_h = (crop_h / 2) * 2;
   if(crop_w <= 0 || crop_h <= 0) return 1;
 
-  // OOM-retry loop: on inference failure step down the model's tile
-  // ladder and rebuild the single-tile geometry + packed tile. mirrors
-  // the batch path's recovery, scoped to one tile (no row_writer to
-  // rewind, no ty/tx==0 guard needed)
-  int T = dt_restore_get_tile_size(ctx);
+  const int T = dt_restore_get_tile_size(ctx);
   if(T <= 0) return 1;
 
-  float *tile_in = NULL;
-  float *tile_out = NULL;
-  int sensor_T = 0;
-  int pp_sr0 = 0, pp_sc0 = 0;
-  size_t tile_out_w = 0;
-  size_t tile_out_plane = 0;
-
-retry:;
-  sensor_T = 2 * T;
+  const int sensor_T = 2 * T;
   const int max_disp = sensor_T - 4 * OVERLAP_PACKED;
   if(crop_w > max_disp || crop_h > max_disp)
-  {
-    g_free(tile_in);
-    g_free(tile_out);
     return 1;
-  }
 
   int inf_x = crop_x + crop_w / 2 - sensor_T / 2;
   int inf_y = crop_y + crop_h / 2 - sensor_T / 2;
@@ -810,13 +821,11 @@ retry:;
   inf_y = (inf_y / 2) * 2;
 
   const size_t tile_in_plane = (size_t)T * T;
-  tile_out_w = 2 * (size_t)T;
-  tile_out_plane = tile_out_w * tile_out_w;
+  const size_t tile_out_w = 2 * (size_t)T;
+  const size_t tile_out_plane = tile_out_w * tile_out_w;
 
-  g_free(tile_in);
-  g_free(tile_out);
-  tile_in = g_try_malloc(tile_in_plane * 4 * sizeof(float));
-  tile_out = g_try_malloc(tile_out_plane * 3 * sizeof(float));
+  float *tile_in = g_try_malloc(tile_in_plane * 4 * sizeof(float));
+  float *tile_out = g_try_malloc(tile_out_plane * 3 * sizeof(float));
   if(!tile_in || !tile_out)
   {
     g_free(tile_in);
@@ -827,8 +836,14 @@ retry:;
   // geometry applies the same orientation + mirror policy as the batch
   // path. sr0_base / sc0_base for the preview is the user-centred,
   // even-snapped inference tile origin in sensor coords
+  int pp_sr0 = 0, pp_sc0 = 0;
   int pp_mir_y_lo, pp_mir_y_hi, pp_mir_x_lo, pp_mir_x_hi;
+  const int pp_vis_x_lo = (img->p_width  > 0) ? img->crop_x : 0;
+  const int pp_vis_y_lo = (img->p_height > 0) ? img->crop_y : 0;
+  const int pp_vis_x_hi = (img->p_width  > 0) ? (img->crop_x + img->p_width)  : width;
+  const int pp_vis_y_hi = (img->p_height > 0) ? (img->crop_y + img->p_height) : height;
   _bayer_tile_geometry(ctx, &prep, inf_y, inf_x, width, height,
+                       pp_vis_y_lo, pp_vis_y_hi, pp_vis_x_lo, pp_vis_x_hi,
                        &pp_sr0, &pp_sc0,
                        &pp_mir_y_lo, &pp_mir_y_hi,
                        &pp_mir_x_lo, &pp_mir_x_hi);
@@ -837,13 +852,18 @@ retry:;
                    pp_mir_y_lo, pp_mir_y_hi, pp_mir_x_lo, pp_mir_x_hi,
                    T, &prep, tile_in);
 
-  if(dt_restore_run_patch_bayer(ctx, tile_in, T, T, tile_out) != 0)
+  gboolean cpu_fallback_done = FALSE;
+  while(dt_restore_run_patch_bayer(ctx, tile_in, T, T, tile_out) != 0)
   {
-    if(dt_restore_step_down_tile_size(ctx, &T))
+    if(!cpu_fallback_done && dt_restore_reload_session_cpu(ctx))
     {
       dt_print(DT_DEBUG_AI,
-               "[restore_raw_bayer] preview failed, retrying at T=%d", T);
-      goto retry;
+               "[restore_raw_bayer] preview GPU inference failed; "
+               "retrying on CPU");
+      dt_control_log(_("AI raw denoise: GPU inference failed, "
+                       "falling back to CPU"));
+      cpu_fallback_done = TRUE;
+      continue;
     }
     dt_print(DT_DEBUG_AI,
              "[restore_raw_bayer] preview inference failed at T=%d", T);
