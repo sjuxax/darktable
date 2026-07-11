@@ -197,9 +197,11 @@ static void _bayer_gain_match(const float *tile_in,
   const double out_mean = out_sum / (double)(3 * tile_out_plane);
   // allow negative gain too: the RawNIND model output scale is
   // arbitrary by design (match_gain post-step during training absorbs
-  // it); in some variants the sign is also inverted. guard only
-  // against near-zero mean
-  const float gain = (fabsf((float)out_mean) > 1e-8f)
+  // it); in some variants the sign is also inverted. guard against
+  // near-zero out_mean relative to in_mean — an absolute threshold
+  // is useless because out_mean is typically ~10^6 * in_mean
+  const double thr = 1e-6 * fabs(in_mean);
+  const float gain = (fabs(out_mean) > thr)
     ? (float)(in_mean / out_mean) : 1.0f;
   if(gain != 1.0f)
   {
@@ -595,11 +597,16 @@ int dt_restore_raw_bayer(dt_restore_context_t *ctx,
         }
       }
 
-      // extended extent = core ± seam where a neighbor exists; matches model-output validity
-      const int ext_y0 = has_top  ? sensor_py_base - sensor_O : sensor_py_base;
-      const int ext_y1 = has_bot  ? sensor_py_end + sensor_O  : sensor_py_end;
-      const int ext_x0 = has_left ? sensor_px_base - sensor_O : sensor_px_base;
-      const int ext_x1 = has_right? sensor_px_end + sensor_O  : sensor_px_end;
+      // extended extent = core ± seam where a neighbor exists; matches
+      // model-output validity; clamped to the CFA buffer bounds
+      const int ext_y0 = MAX(0,
+                             has_top? sensor_py_base - sensor_O : sensor_py_base);
+      const int ext_y1 = MIN(height,
+                             has_bot  ? sensor_py_end + sensor_O  : sensor_py_end);
+      const int ext_x0 = MAX(0,
+                             has_left ? sensor_px_base - sensor_O : sensor_px_base);
+      const int ext_x1 = MIN(width,
+                             has_right? sensor_px_end + sensor_O  : sensor_px_end);
 
       for(int sr = ext_y0; sr < ext_y1; sr++)
       {

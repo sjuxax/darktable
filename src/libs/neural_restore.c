@@ -202,6 +202,7 @@
 #include "common/grouping.h"
 #include "common/image_cache.h"
 #include "common/mipmap_cache.h"
+#include "common/tags.h"
 #include "control/jobs/control_jobs.h"
 #include "control/signal.h"
 #include "develop/develop.h"
@@ -315,6 +316,9 @@ typedef struct dt_lib_neural_restore_t
   // X-Trans / linear) so re-picking a new crop on the same image skips
   // the slow load + demosaic; freed on imgid or sensor-type change.
   dt_imgid_t preview_raw_imgid;
+  // imgid we last showed the "pre-demosaiced" warning for, so the
+  // toast doesn't fire every patch-click move during preview
+  dt_imgid_t preview_linear_warned_imgid;
   dt_restore_sensor_class_t preview_raw_sensor_class;
   float *preview_full_cfa;       // Bayer: full sensor (w*h floats)
   int preview_full_w;
@@ -390,6 +394,10 @@ typedef struct dt_neural_job_t
   char *icc_filename;  // only used when icc_type == DT_COLORSPACE_FILE
   // when TRUE, wide-gamut pixels pass through unchanged on denoise
   gboolean preserve_wide_gamut;
+  // raw denoise only: TRUE after we've toasted the "pre-demosaiced"
+  // caveat for any LINEAR image in this batch; avoids one warning
+  // per file when the user kicks off a multi-image job
+  gboolean linear_warned;
 } dt_neural_job_t;
 
 typedef struct dt_neural_format_params_t
@@ -986,7 +994,7 @@ static void _import_image(const char *filename,
   char *dir = g_path_get_dirname(filename);
   const dt_filmid_t filmid = dt_film_new(&film, dir);
   g_free(dir);
-  const dt_imgid_t newid = dt_image_import(filmid, filename, FALSE, FALSE);
+  const dt_imgid_t newid = dt_image_import(filmid, filename, TRUE, FALSE);
   dt_film_cleanup(&film);
 
   if(dt_is_valid_imgid(newid))
@@ -1003,6 +1011,18 @@ static void _import_image(const char *filename,
       dt_image_cache_read_release(src);
       if(source_is_leader)
         dt_grouping_change_representative(newid);
+
+      // propagate the source's user tags so the output stays visible
+      // in tag-based collections (TRUE = skip darktable|* auto-tags)
+      GList *src_tags = NULL;
+      if(dt_tag_get_attached(source_imgid, &src_tags, TRUE))
+      {
+        GList *targets = g_list_prepend(NULL, GINT_TO_POINTER(newid));
+        for(GList *t = src_tags; t; t = t->next)
+          dt_tag_attach_images(((dt_tag_t *)t->data)->id, targets, FALSE);
+        g_list_free(targets);
+      }
+      dt_tag_free_result(&src_tags);
     }
     // refresh the collection so the new image appears in the thumb grid
     dt_collection_update_query(darktable.collection,
@@ -1100,27 +1120,27 @@ static int _ensure_raw_ctx(dt_neural_job_t *j,
     dt_restore_unref(j->ctx);
     j->ctx = NULL;
   }
-  const char *label = NULL;
+  const char *message = NULL;
   switch(cls)
   {
     case DT_RESTORE_SENSOR_CLASS_BAYER:
       j->ctx = dt_restore_load_rawdenoise_bayer(j->env);
-      label = _("bayer");
+      message = _("failed to load AI model for Bayer raw denoising");
       break;
     case DT_RESTORE_SENSOR_CLASS_XTRANS:
       j->ctx = dt_restore_load_rawdenoise_xtrans(j->env);
-      label = _("x-trans");
+      message = _("failed to load AI model for X-Trans raw denoising");
       break;
     case DT_RESTORE_SENSOR_CLASS_LINEAR:
       j->ctx = dt_restore_load_rawdenoise_linear(j->env);
-      label = _("linear");
+      message = _("failed to load AI model for linear raw denoising");
       break;
     default:
       return 1;
   }
   if(!j->ctx)
   {
-    dt_control_log(_("failed to load AI raw denoise %s model"), label);
+    dt_control_log(message, (char* )NULL);
     return 1;
   }
   j->raw_ctx_sensor_class = cls;
@@ -1224,6 +1244,7 @@ static int _process_raw_denoise_bayer(dt_neural_job_t *j,
   g_free(jpeg_buf);
   g_free(exif_blob);
   g_free(cfa_out);
+  if(res != 0) g_unlink(out_filename);
   return res;
 }
 
@@ -1275,6 +1296,7 @@ static int _process_raw_denoise_linear(dt_neural_job_t *j,
   g_free(jpeg_buf);
   g_free(exif_blob);
   dt_free_align(rgb);
+  if(res != 0) g_unlink(out_filename);
   return res;
 }
 
@@ -1322,7 +1344,7 @@ static int _process_raw_denoise_one(dt_neural_job_t *j,
 
   if(cls == DT_RESTORE_SENSOR_CLASS_UNSUPPORTED)
   {
-    dt_control_log(_("raw denoise: image is not a supported raw sensor format"));
+    dt_control_log(_("raw denoise: image is not in a supported raw sensor format"));
     return 1;
   }
 
@@ -1341,6 +1363,18 @@ static int _process_raw_denoise_one(dt_neural_job_t *j,
       return _process_raw_denoise_linear(j, imgid, out_filename,
                                          src_path, &img_meta);
     case DT_RESTORE_SENSOR_CLASS_LINEAR:
+      // most LINEAR-class inputs are computational raws (Apple
+      // ProRAW, Google HDR+, etc.) that have already been denoised
+      // on-device; the model will run but adds little; Canon/Nikon
+      // sRAW is the exception; warn once per job and proceed.
+      // 4BAYER (CYGM/RGBE) piggybacks on LINEAR class but isn't a
+      // computational raw — skip the misleading toast
+      if(!j->linear_warned && !(flags & DT_IMAGE_4BAYER))
+      {
+        j->linear_warned = TRUE;
+        dt_control_log(_("raw denoise: this image is already pre-demosaiced "
+                         "(sRaw / computational raw); results may be limited"));
+      }
       return _process_raw_denoise_linear(j, imgid, out_filename,
                                          src_path, &img_meta);
     default:
@@ -2275,6 +2309,11 @@ static void _cancel_preview(dt_lib_module_t *self)
   d->export_pixels = NULL;
   g_free(d->export_cairo);
   d->export_cairo = NULL;
+  // raw-denoise crops — strength slider would otherwise reblend stale
+  g_free(d->preview_raw_src_rgb);
+  d->preview_raw_src_rgb = NULL;
+  g_free(d->preview_raw_denoised_rgb);
+  d->preview_raw_denoised_rgb = NULL;
   d->picking_thumbnail = FALSE;
   gtk_widget_queue_draw(d->preview_area);
 }
@@ -2656,23 +2695,43 @@ static gpointer _preview_thread_raw(gpointer data)
 
   const uint32_t filters = img_meta.buf_dsc.filters;
   const dt_restore_sensor_class_t cls = dt_restore_classify_sensor(&img_meta);
-  const gboolean is_xtrans = (cls == DT_RESTORE_SENSOR_CLASS_XTRANS);
-  if(cls != DT_RESTORE_SENSOR_CLASS_BAYER
-     && cls != DT_RESTORE_SENSOR_CLASS_XTRANS)
+  // today x-trans piggybacks on the linear pipeline because we don't
+  // ship a dedicated x-trans denoise model yet. when one lands, drop
+  // XTRANS from use_linear and add an x-trans branch alongside the
+  // use_linear and bayer paths (buffer fetch, preview pipe, max_disp)
+  const gboolean use_linear = (cls == DT_RESTORE_SENSOR_CLASS_XTRANS
+                               || cls == DT_RESTORE_SENSOR_CLASS_LINEAR);
+  if(cls != DT_RESTORE_SENSOR_CLASS_BAYER && !use_linear)
   {
     dt_print(DT_DEBUG_AI,
-             "[neural_restore] raw preview: imgid %d is not bayer/xtrans "
+             "[neural_restore] raw preview: imgid %d unsupported "
              "(filters=0x%x class=%d)",
              pd->imgid, filters, cls);
     bail_err = DT_NR_PREVIEW_ERR_UNSUPPORTED;
     goto cleanup;
   }
+  const char *cls_name = (cls == DT_RESTORE_SENSOR_CLASS_XTRANS) ? "x-trans"
+                       : use_linear                              ? "linear"
+                       :                                           "bayer";
   dt_print(DT_DEBUG_AI,
            "[neural_restore] raw preview: imgid=%d %s patch=(%.3f,%.3f) "
            "widget=%dx%d filters=0x%x",
-           pd->imgid, is_xtrans ? "x-trans" : "bayer",
+           pd->imgid, cls_name,
            pd->patch_center[0], pd->patch_center[1],
            pd->preview_w, pd->preview_h, filters);
+
+  // same caveat as the batch path: LINEAR is usually a computational
+  // raw that's already been denoised on-device. warn once per imgid
+  // so picking a different patch doesn't re-toast. 4BAYER piggybacks
+  // on LINEAR class but isn't computational — skip the toast for it
+  if(cls == DT_RESTORE_SENSOR_CLASS_LINEAR
+     && !(img_meta.flags & DT_IMAGE_4BAYER)
+     && d->preview_linear_warned_imgid != pd->imgid)
+  {
+    d->preview_linear_warned_imgid = pd->imgid;
+    dt_control_log(_("raw denoise: this image is already pre-demosaiced "
+                     "(sRaw / computational raw); results may be limited"));
+  }
 
   // 2. ensure the right ctx is loaded (matches batch logic in
   //    _ensure_raw_ctx). reload if cached_task is wrong or if the
@@ -2694,6 +2753,9 @@ static gpointer _preview_thread_raw(gpointer data)
           break;
         case DT_RESTORE_SENSOR_CLASS_XTRANS:
           d->cached_ctx = dt_restore_load_rawdenoise_xtrans(pd->env);
+          break;
+        case DT_RESTORE_SENSOR_CLASS_LINEAR:
+          d->cached_ctx = dt_restore_load_rawdenoise_linear(pd->env);
           break;
         default:
           d->cached_ctx = NULL;
@@ -2733,12 +2795,12 @@ static gpointer _preview_thread_raw(gpointer data)
   const gboolean cache_matches
     = d->preview_raw_imgid == pd->imgid
       && d->preview_raw_sensor_class == cls
-      && ((is_xtrans && d->preview_full_lin)
-          || (!is_xtrans && d->preview_full_cfa));
+      && ((use_linear && d->preview_full_lin)
+          || (!use_linear && d->preview_full_cfa));
 
   if(cache_matches)
   {
-    if(is_xtrans)
+    if(use_linear)
     {
       full_lin_use = d->preview_full_lin;
       full_w = d->preview_lin_w;
@@ -2751,7 +2813,7 @@ static gpointer _preview_thread_raw(gpointer data)
       full_h = d->preview_full_h;
     }
   }
-  else if(is_xtrans)
+  else if(use_linear)
   {
     if(dt_restore_raw_linear_prepare(ctx, pd->imgid, &take_full_lin,
                                      &full_w, &full_h) != 0
@@ -2841,6 +2903,12 @@ static gpointer _preview_thread_raw(gpointer data)
     gchar *cfg_file = (cfg_type == DT_COLORSPACE_FILE)
       ? dt_conf_get_string(CONF_ICC_FILE)
       : NULL;
+    const dt_colorspaces_color_profile_t *work_cp
+      = dt_colorspaces_get_work_profile(pd->imgid);
+    const dt_colorspaces_color_profile_type_t dst_type
+      = (cfg_type == DT_COLORSPACE_NONE)
+        ? (work_cp ? work_cp->type : DT_COLORSPACE_LIN_REC2020)
+        : cfg_type;
     dt_imageio_export_with_flags(
       pd->imgid, "unused", &fmt,
       (dt_imageio_module_data_t *)&cap,
@@ -2854,9 +2922,7 @@ static gpointer _preview_thread_raw(gpointer data)
       NULL,   // filter
       FALSE,  // copy_metadata
       FALSE,  // export_masks
-      (cfg_type == DT_COLORSPACE_NONE)
-        ? dt_colorspaces_get_work_profile(pd->imgid)->type
-        : cfg_type,
+      dst_type,
       cfg_file,
       DT_INTENT_PERCEPTUAL,
       NULL, NULL, 1, 1, NULL, -1);
@@ -2877,7 +2943,7 @@ static gpointer _preview_thread_raw(gpointer data)
   // crop in sensor pixels:
   //   bayer:  2*T - 4*overlap_packed = 2*T - 128  (for OVERLAP_PACKED=32)
   //   linear: T   - 2*overlap_linear = T   - 64   (for OVERLAP_LINEAR=32)
-  const int max_disp = is_xtrans ? (T - 64) : (2 * T - 128);
+  const int max_disp = use_linear ? (T - 64) : (2 * T - 128);
 
   // the raw buffer is always landscape (sensor layout), but the preview
   // thumbnail the user clicks on is oriented per EXIF. un-rotate the
@@ -2889,7 +2955,7 @@ static gpointer _preview_thread_raw(gpointer data)
   int crop_w = MIN(swap_xy ? pd->preview_h : pd->preview_w, max_disp);
   int crop_h = MIN(swap_xy ? pd->preview_w : pd->preview_h, max_disp);
   // Bayer: snap to mod 2 (CFA grid)
-  if(!is_xtrans)
+  if(!use_linear)
   {
     crop_w = (crop_w / 2) * 2;
     crop_h = (crop_h / 2) * 2;
@@ -2919,7 +2985,7 @@ static gpointer _preview_thread_raw(gpointer data)
   int crop_y = (int)sy - crop_h / 2;
   crop_x = CLAMP(crop_x, 0, full_w - crop_w);
   crop_y = CLAMP(crop_y, 0, full_h - crop_h);
-  if(!is_xtrans)
+  if(!use_linear)
   {
     crop_x = (crop_x / 2) * 2;
     crop_y = (crop_y / 2) * 2;
@@ -2930,8 +2996,7 @@ static gpointer _preview_thread_raw(gpointer data)
            "patch_center=(%.3f,%.3f) -> sensor=(%d,%d %dx%d) %s",
            full_w, full_h, (unsigned)ori,
            pd->patch_center[0], pd->patch_center[1],
-           crop_x, crop_y, crop_w, crop_h,
-           is_xtrans ? "linear" : "bayer");
+           crop_x, crop_y, crop_w, crop_h, cls_name);
 
   // 5. inference
   // Bayer path uses the _piped variant which runs darktable's full
@@ -2944,7 +3009,7 @@ static gpointer _preview_thread_raw(gpointer data)
   float *denoised_rgb = NULL;
   int actual_w = 0, actual_h = 0;
   int err;
-  if(is_xtrans)
+  if(use_linear)
     err = dt_restore_raw_linear_preview_piped(ctx, &img_meta, pd->imgid,
                                               full_lin_use,
                                               full_w, full_h,
@@ -3076,6 +3141,8 @@ static void _trigger_preview(dt_lib_module_t *self)
 
   if(!d->model_available || !d->preview_requested)
     return;
+
+  if(dt_view_get_current() == DT_VIEW_DARKROOM) dt_dev_write_history(darktable.develop);
 
   // invalidate current preview and bump sequence so running thread exits early
   d->preview_ready = FALSE;
@@ -3247,6 +3314,8 @@ static void _process_clicked(GtkWidget *widget, gpointer user_data)
   GList *images = dt_act_on_get_images(TRUE, TRUE, FALSE);
   if(!images)
     return;
+
+  if(dt_view_get_current() == DT_VIEW_DARKROOM) dt_dev_write_history(darktable.develop);
 
   dt_neural_job_t *job_data = g_new0(dt_neural_job_t, 1);
   job_data->task = d->task;
@@ -3794,6 +3863,10 @@ static gboolean _preview_draw(GtkWidget *widget,
   return FALSE;
 }
 
+// pointer within this distance of the divider shows the resize cursor;
+// clicks within this distance grip the divider without snapping it
+#define PREVIEW_DIVIDER_NEAR_PX  3.0
+
 static gboolean _preview_button_press(GtkWidget *widget,
                                       GdkEventButton *event,
                                       dt_lib_module_t *self)
@@ -3876,13 +3949,18 @@ static gboolean _preview_button_press(GtkWidget *widget,
   const double ox = (w - pw * scale) / 2.0;
   const double div_x = ox + d->split_pos * pw * scale;
 
-  if(fabs(ex - div_x) < 8.0)
+  if(fabs(ex - div_x) < PREVIEW_DIVIDER_NEAR_PX)
   {
+    // precision grip on the divider — drag without snapping
     d->dragging_split = TRUE;
     return TRUE;
   }
 
-  return FALSE;
+  // click anywhere else snaps the divider then enters drag
+  d->split_pos = CLAMP((ex - ox) / (pw * scale), 0.0, 1.0);
+  d->dragging_split = TRUE;
+  gtk_widget_queue_draw(widget);
+  return TRUE;
 }
 
 static gboolean _preview_button_release(GtkWidget *widget,
@@ -3970,7 +4048,7 @@ static gboolean _preview_motion(GtkWidget *widget,
     GdkWindow *win = gtk_widget_get_window(widget);
     if(win)
     {
-      const gboolean near = fabs(ex - div_x) < 8.0;
+      const gboolean near = fabs(ex - div_x) < PREVIEW_DIVIDER_NEAR_PX;
       if(near)
       {
         GdkCursor *cursor = gdk_cursor_new_from_name(

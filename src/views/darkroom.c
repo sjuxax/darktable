@@ -591,6 +591,12 @@ void expose(dt_view_t *self,
         port->pipe->backbuf                                // do we have an image?
      && port->pipe->output_imgid == dev->image_storage.id; // same image?
 
+  const gboolean use_loading_screen =
+#ifdef _WIN32
+    TRUE;
+#else
+    dt_conf_get_bool("darkroom/ui/loading_screen");
+#endif
   if(expose_full)
   {
     // draw image
@@ -601,7 +607,7 @@ void expose(dt_view_t *self,
       cairo_surface_destroy(darktable.gui->surface);
       darktable.gui->surface = NULL;
     }
-    if(!dt_conf_get_bool("darkroom/ui/loading_screen"))
+    if(!use_loading_screen)
     {
       // cache the rendered bitmap for use while loading the next image
       darktable.gui->surface = cairo_get_target(cri);
@@ -687,14 +693,14 @@ void expose(dt_view_t *self,
     else
     {
       fontsize = DT_PIXEL_APPLY_DPI(14);
-      if(dt_conf_get_bool("darkroom/ui/loading_screen"))
+      if(use_loading_screen)
         load_txt = g_strdup_printf(C_("darkroom", "loading `%s' ..."),
                                    dev->image_storage.filename);
       else
         load_txt = g_strdup(dev->image_storage.filename);
     }
 
-    if(dt_conf_get_bool("darkroom/ui/loading_screen"))
+    if(use_loading_screen)
     {
       dt_gui_gtk_set_source_rgb(cri, DT_GUI_COLOR_DARKROOM_BG);
       cairo_paint(cri);
@@ -1763,9 +1769,9 @@ static void _latescaling_quickbutton_clicked(GtkWidget *w,
           || (dev->second_wnd && dev->preview2.pipe->processing)))
   {
     if(dev->full.pipe->processing)
-      dt_atomic_set_int(&dev->full.pipe->shutdown, DT_DEV_PIXELPIPE_STOP_HQ);
+      dt_dev_pixelpipe_set_shutdown(dev->full.pipe, DT_DEV_PIXELPIPE_STOP_HQ);
     if(dev->second_wnd && dev->preview2.pipe->processing)
-      dt_atomic_set_int(&dev->preview2.pipe->shutdown, DT_DEV_PIXELPIPE_STOP_HQ);
+      dt_dev_pixelpipe_set_shutdown(dev->preview2.pipe, DT_DEV_PIXELPIPE_STOP_HQ);
 
     // do it the hard way for safety
     dt_dev_pixelpipe_rebuild(dev);
@@ -3201,7 +3207,7 @@ void gui_init(dt_view_t *self)
                                                               0,
                                                               _display2_intent_callback,
                                                               dev, intents_list);
-        
+
     if(!force_lcms2)
     {
       gtk_widget_set_no_show_all(dev->profile.display_intent_widget, TRUE);
@@ -4211,12 +4217,14 @@ gboolean gesture_pan(dt_view_t *self,
   (void)state;
   if(!dev) return FALSE;
 
-  // Mask editing (brush etc.) uses scroll for tool parameters.
+  // If pointer is over an active mask, let scroll go to the mask handler;
+  // otherwise allow two-finger scroll to pan the image.
   if(dev->form_visible
-     && !darktable.develop->darkroom_skip_mouse_events)
+     && !darktable.develop->darkroom_skip_mouse_events
+     && dt_masks_scroll_over_mask())
   {
     dt_print(DT_DEBUG_INPUT,
-             "[darkroom pan] ignored: mask form active");
+             "[darkroom pan] ignored: pointer over active mask");
     return FALSE;
   }
 
@@ -4866,11 +4874,11 @@ static void _darkroom_ui_second_window_cleanup(dt_develop_t *dev)
     pinned_dev->preview2.widget = NULL;
 
     if(pinned_dev->preview2.pipe)
-      dt_atomic_set_int(&pinned_dev->preview2.pipe->shutdown, DT_DEV_PIXELPIPE_STOP_NODES);
+      dt_dev_pixelpipe_set_shutdown(pinned_dev->preview2.pipe, DT_DEV_PIXELPIPE_STOP_NODES);
     if(pinned_dev->preview_pipe)
-      dt_atomic_set_int(&pinned_dev->preview_pipe->shutdown, DT_DEV_PIXELPIPE_STOP_NODES);
+      dt_dev_pixelpipe_set_shutdown(pinned_dev->preview_pipe, DT_DEV_PIXELPIPE_STOP_NODES);
     if(pinned_dev->full.pipe)
-      dt_atomic_set_int(&pinned_dev->full.pipe->shutdown, DT_DEV_PIXELPIPE_STOP_NODES);
+      dt_dev_pixelpipe_set_shutdown(pinned_dev->full.pipe, DT_DEV_PIXELPIPE_STOP_NODES);
 
     if(pinned_dev->preview2.pipe)
     {
