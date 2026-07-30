@@ -45,6 +45,8 @@
 #define DT_OPENCL_SYSMEM_ALLOCATION -998
 #define DT_OPENCL_PROCESS_CL -997
 #define DT_OPENCL_NODEVICE -996
+#define DT_OPENCL_SPURIOUS -995
+#define DT_OPENCL_MIGRATE -994
 
 #include "common/darktable.h"
 
@@ -151,6 +153,7 @@ typedef struct dt_opencl_device_t
   const char *cname;
   const char *options;
   const char *cflags;
+  const char *avoid;
   cl_int summary;
   size_t memory_in_use;
   size_t peak_memory;
@@ -211,8 +214,6 @@ typedef struct dt_opencl_device_t
 
   // lets keep the vendor for runtime checks
   int vendor_id;
-
-  float advantage;
 } dt_opencl_device_t;
 
 struct dt_bilateral_cl_global_t;
@@ -234,6 +235,9 @@ typedef struct dt_opencl_t
   gboolean enabled;
   gboolean stopped;
   gboolean fastcl;  // for fast runtime checks instead of reading the conf
+  gboolean fast_tiling;
+  gboolean spurious;
+  gboolean migrate;
   int num_devs;
   int error_count;
   int opencl_synchronization_timeout;
@@ -307,7 +311,7 @@ int dt_opencl_get_device_info(dt_opencl_t *cl,
 
 /** inits the opencl subsystem. */
 void dt_opencl_init(dt_opencl_t *cl,
-                    const gboolean exclude_opencl,
+                    const int options,
                     const gboolean print_statistics);
 
 /** cleans up the opencl subsystem. */
@@ -465,6 +469,16 @@ int dt_opencl_write_host_to_image_raw(const int devid,
                                        const int rowpitch,
                                        const gboolean blocking);
 
+int dt_opencl_fill_buffer(const int devid,
+                          cl_mem buffer,
+                          const size_t pts,
+                          const size_t ch,
+                          const float val);
+int dt_opencl_fill_image(const int devid,
+                         cl_mem image,
+                         const size_t *orig,
+                         const size_t *area,
+                         const float val);
 void *dt_opencl_copy_host_to_image(const int devid,
                                     void *host,
                                     const int width,
@@ -572,9 +586,6 @@ gboolean dt_opencl_image_fits_device(const int devid,
 /** get available memory for the device */
 cl_ulong dt_opencl_get_device_available(const int devid);
 
-/** check tuning settings and available memory for the device */
-void dt_opencl_check_tuning(const int devid);
-
 /** get size of allocatable single buffer */
 cl_ulong dt_opencl_get_device_memalloc(const int devid);
 
@@ -628,7 +639,7 @@ typedef struct dt_opencl_t
 } dt_opencl_t;
 
 static inline void dt_opencl_init(dt_opencl_t *cl,
-                                  const gboolean exclude_opencl,
+                                  const int options,
                                   const gboolean print_statistics)
 {
   cl->inited = FALSE;

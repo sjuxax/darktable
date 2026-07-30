@@ -1,6 +1,6 @@
 /*
     This file is part of darktable,
-    Copyright (C) 2009-2025 darktable developers.
+    Copyright (C) 2009-2026 darktable developers.
 
     darktable is free software: you can redistribute it and/or modify
     it under the terms of the GNU General Public License as published by
@@ -324,7 +324,12 @@ void dt_control_set_temp_cursor(const char *cursor_name)
 void dt_control_clear_temp_cursor()
 {
   GdkWindow *window = gtk_widget_get_window(dt_ui_main_window(darktable.gui->ui));
-  if(!_prev_cursor) return;
+  if(!_prev_cursor)
+  {
+    if(window)
+      gdk_window_set_cursor(window, NULL);
+    return;
+  }
   if(window)
     gdk_window_set_cursor(window, _prev_cursor);
   g_object_unref(_prev_cursor);
@@ -396,7 +401,6 @@ void dt_control_quit()
   if(g_atomic_int_get(&darktable.gui_running))
   {
     dt_gui_gtk_quit();
-    gtk_main_quit();
   }
 }
 

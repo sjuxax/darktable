@@ -273,7 +273,7 @@ gboolean dt_dev_pixelpipe_init_cached(dt_dev_pixelpipe_t *pipe,
   pipe->processed_height = pipe->backbuf_height = pipe->iheight = pipe->final_height = 0;
   pipe->nodes = NULL;
   pipe->backbuf_size = size;
-  pipe->cache_obsolete = FALSE;
+  pipe->cache_obsolete_order = INT_MAX;
   pipe->backbuf = NULL;
   pipe->backbuf_scale = 0.0f;
   memset(pipe->backbuf_zoom_pos, 0, sizeof(dt_dev_zoom_pos_t));
@@ -466,9 +466,9 @@ void dt_dev_pixelpipe_rebuild(dt_develop_t *dev)
   dev->preview_pipe->changed |= DT_DEV_PIPE_REMOVE;
   dev->preview2.pipe->changed |= DT_DEV_PIPE_REMOVE;
 
-  dev->full.pipe->cache_obsolete = TRUE;
-  dev->preview_pipe->cache_obsolete = TRUE;
-  dev->preview2.pipe->cache_obsolete = TRUE;
+  dev->full.pipe->cache_obsolete_order = 0;
+  dev->preview_pipe->cache_obsolete_order = 0;
+  dev->preview2.pipe->cache_obsolete_order = 0;
 
   // invalidate buffers and force redraw of darkroom
   dt_dev_invalidate_all(dev);
@@ -530,6 +530,7 @@ static void _dev_pixelpipe_synch(dt_dev_pixelpipe_t *pipe,
   const dt_image_t *img      = &pipe->image;
   const dt_imgid_t imgid     = img->id;
   const gboolean rawprep_img = dt_image_is_rawprepare_supported(img);
+  const gboolean raw_img = dt_image_is_raw(img);
 
   for(GList *nodes = pipe->nodes; nodes; nodes = g_list_next(nodes))
   {
@@ -628,9 +629,88 @@ static void _dev_pixelpipe_synch(dt_dev_pixelpipe_t *pipe,
         const dt_develop_blend_params_t *const bp = piece->blendop_data;
         const gboolean valid_mask = bp->mask_mode > DEVELOP_MASK_ENABLED;
 
-        if(!feqf(bp->details, 0.0f, 1e-6) && valid_mask)
-          dt_dev_pixelpipe_usedetails(piece);
+        if(!feqf(bp->details, 0.0f, 1e-6) && valid_mask && pipe->want_detail_mask == FALSE)
+        {
+          dt_iop_module_t *gen = raw_img ? dt_iop_get_module("demosaic") : NULL;
+          dt_dev_pixelpipe_cache_invalidate_later(pipe, gen ? gen->iop_order : 0, "usedetails ");
+          pipe->want_detail_mask = TRUE;
+        }
       }
+    }
+  }
+}
+
+/** remove stale entries (deleted, disabled or de-synced consumers) from a
+    raster mask source's users table, so it doesn't keep
+    publishing/invalidating forever */
+static void _iop_prune_stale_raster_users(dt_dev_pixelpipe_t *pipe, dt_iop_module_t *module)
+{
+  GHashTable *users = module->raster_mask.source.users;
+  if(!module->dev || !users || g_hash_table_size(users) == 0)
+    return;
+
+  /* Phantom users (deleted or de-synced consumers) keep the source republishing
+     -- and invalidating downstream -- every run. Judge each consumer from its
+     node in THIS pipe, never from module->enabled/blend_params: those track the
+     darkroom UI and are stale in the export pipe, where the piece is authoritative
+     (dropped a live export consumer's mask, regression 0167-raster-mask). We only
+     compare the consumer pointer, so a freed module is never dereferenced. */
+  GHashTableIter iter;
+  gpointer key, value;
+  g_hash_table_iter_init(&iter, users);
+  while(g_hash_table_iter_next(&iter, &key, &value))
+  {
+    dt_iop_module_t *sink = key;
+
+    // locate the consumer's node in this pipe (pointer-only match)
+    dt_dev_pixelpipe_iop_t *sink_piece = NULL;
+    for(GList *nodes = pipe->nodes; nodes; nodes = g_list_next(nodes))
+    {
+      dt_dev_pixelpipe_iop_t *p = nodes->data;
+      if(p->module == sink)
+      {
+        sink_piece = p;
+        break;
+      }
+    }
+    if(!sink_piece)
+    {
+      g_hash_table_iter_remove(&iter);
+      dt_print_pipe(DT_DEBUG_PIPE | DT_DEBUG_MASKS,
+                    "prune stale raster user",
+                    pipe,
+                    module,
+                    DT_DEVICE_NONE,
+                    NULL,
+                    NULL,
+                    "dropped deleted consumer");
+      continue;
+    }
+
+    // a real consumer must still point back at us, have its node enabled in
+    // this pipe, and actually have its blending in raster-mask mode. A module
+    // that named us as raster source but is then disabled (or switched its mask
+    // to drawn/parametric) leaves a phantom entry that would otherwise keep us
+    // publishing -- and invalidating every downstream cacheline -- on every run.
+    const dt_develop_blend_params_t *bp = sink_piece->blendop_data;
+    const gboolean consumes = sink->raster_mask.sink.source == module && sink_piece->enabled &&
+                              bp && (bp->mask_mode & DEVELOP_MASK_RASTER);
+    if(!consumes)
+    {
+      g_hash_table_iter_remove(&iter);
+      dt_print_pipe(DT_DEBUG_PIPE | DT_DEBUG_MASKS,
+                    "prune stale raster user",
+                    pipe,
+                    module,
+                    DT_DEVICE_NONE,
+                    NULL,
+                    NULL,
+                    "dropped '%s%s' (%s)",
+                    sink->op,
+                    dt_iop_get_instance_id(sink),
+                    sink->raster_mask.sink.source != module ? "de-synced"
+                    : !sink_piece->enabled                  ? "disabled"
+                                                            : "not in raster mode");
     }
   }
 }
@@ -664,17 +744,18 @@ void dt_dev_pixelpipe_synch_all(dt_dev_pixelpipe_t *pipe, dt_develop_t *dev)
   dt_dev_clear_scharr_mask(pipe);
   pipe->want_detail_mask = FALSE;
 
-  /* go through all history items and adjust params
-     We might call dt_dev_pixelpipe_usedetails() with want_detail_mask == FALSE
-     here resulting in a pipecache invalidation.
-     Can this somehow be avoided?
-  */
   GList *history = dev->history;
   for(int k = 0; k < dev->history_end && history; k++)
   {
     _dev_pixelpipe_synch(pipe, dev, history);
     history = g_list_next(history);
   }
+
+  // history has been (re)applied, so real raster consumers have re-registered;
+  // drop any phantom users left behind by deleted or de-synced consumers
+  for(GList *nodes = pipe->nodes; nodes; nodes = g_list_next(nodes))
+    _iop_prune_stale_raster_users(pipe, ((dt_dev_pixelpipe_iop_t *)nodes->data)->module);
+
   dt_print_pipe(DT_DEBUG_PARAMS,
            "synch all modules done",
            pipe, NULL, DT_DEVICE_NONE, NULL, NULL,
@@ -699,6 +780,12 @@ void dt_dev_pixelpipe_synch_top(dt_dev_pixelpipe_t *pipe, dt_develop_t *dev)
     dt_print_pipe(DT_DEBUG_PARAMS, "synch top history module missing!",
       pipe, NULL, DT_DEVICE_NONE, NULL, NULL);
   }
+
+  // clear any phantom raster users (deleted/de-synced consumers) so a source
+  // doesn't keep republishing its mask and invalidating downstream every run
+  for(GList *nodes = pipe->nodes; nodes; nodes = g_list_next(nodes))
+    _iop_prune_stale_raster_users(pipe, ((dt_dev_pixelpipe_iop_t *)nodes->data)->module);
+
   dt_pthread_mutex_unlock(&pipe->busy_mutex);
 }
 
@@ -747,17 +834,6 @@ void dt_dev_pixelpipe_change(dt_dev_pixelpipe_t *pipe, dt_develop_t *dev)
                                   pipe->iwidth, pipe->iheight,
                                   &pipe->processed_width,
                                   &pipe->processed_height);
-}
-
-void dt_dev_pixelpipe_usedetails(dt_dev_pixelpipe_iop_t *piece)
-{
-  dt_dev_pixelpipe_t *pipe = piece->pipe;
-  if(!pipe->want_detail_mask)
-  {
-    dt_print_pipe(DT_DEBUG_PIPE, "details requested", pipe, piece->module, DT_DEVICE_NONE, NULL, NULL);
-    dt_dev_pixelpipe_cache_invalidate_later(pipe, 0, "usedetails ");
-    pipe->want_detail_mask = TRUE;
-  }
 }
 
 static void _dump_pipe_pfm_diff(const char *mod,
@@ -1695,6 +1771,13 @@ static void _opencl_dump_diff_pipe_pfm(dt_dev_pixelpipe_t *pipe,
     dt_free_align(clin);
   }
 }
+
+static inline gboolean _avoid_cl_module(const dt_dev_pixelpipe_iop_t *piece)
+{
+  const dt_opencl_device_t *cldid = &darktable.opencl->dev[piece->pipe->devid];
+  return cldid->avoid && dt_str_commasubstring(cldid->avoid, piece->module->op);
+}
+
 #endif
 
 static inline gboolean _skip_piece_on_tags(const dt_dev_pixelpipe_iop_t *piece)
@@ -2141,7 +2224,8 @@ static gboolean _dev_pixelpipe_process_rec(dt_dev_pixelpipe_t *pipe,
     gboolean possible_cl =
         module->process_cl
         && piece->process_cl_ready
-        && !(dt_pipe_is_preview(pipe) && (module->flags() & IOP_FLAGS_PREVIEW_NON_OPENCL));
+        && !(dt_pipe_is_preview(pipe) && (module->flags() & IOP_FLAGS_PREVIEW_NON_OPENCL))
+        && !_avoid_cl_module(piece);
 
     const uint32_t m_bpp = MAX(in_bpp, bpp);
     const size_t m_width = MAX(roi_in.width, roi_out->width);
@@ -2155,24 +2239,6 @@ static gboolean _dev_pixelpipe_process_rec(dt_dev_pixelpipe_t *pipe,
     {
       if(!_piece_may_tile(piece))
         possible_cl = FALSE;
-
-      const float advantage = darktable.opencl->dev[pipe->devid].advantage;
-      if(possible_cl && (advantage > 0.0f))
-      {
-        const float tilemem_cl = dt_tiling_estimate_clmem(&tiling, piece,
-                                                          &roi_in, roi_out, m_bpp);
-        const float tilemem_cpu = dt_tiling_estimate_cpumem(&tiling, piece,
-                                                            &roi_in, roi_out, m_bpp);
-        if((tilemem_cpu * advantage) < tilemem_cl)
-        {
-          dt_print(DT_DEBUG_OPENCL | DT_DEBUG_TILING,
-                   "[dt_dev_pixelpipetiling_cl] [%s] estimates cpu"
-                   " advantage in `%s', (dev=%i, adv=%.2f, GPU %.2f CPU %.2f)",
-                   dt_dev_pixelpipe_type_to_str(pipe->type), module->op, pipe->devid,
-                   advantage, tilemem_cl / 1e9, tilemem_cpu / 1e9);
-          possible_cl = FALSE;
-        }
-      }
     }
 
     if(possible_cl)
@@ -3085,9 +3151,14 @@ gboolean dt_dev_pixelpipe_process(dt_dev_pixelpipe_t *pipe,
   dt_dev_zoom_pos_t pts = { zx, zy, zx + 1000.f, zy, zx, zy + 1000.f };
   dt_dev_distort_backtransform_plus(dev, pipe, 0.0f, DT_DEV_TRANSFORM_DIR_ALL_GEOMETRY, pts, 3);
 
-  // get a snapshot of mask list
+  // get a snapshot of mask list. Serialized against GUI-thread mutation of
+  // dev->forms/form->points (mask editing) via the same history_mutex used
+  // there, since g_list_copy_deep would otherwise walk a list that the GUI
+  // thread can concurrently free and replace (e.g. path grow/shrink).
+  dt_pthread_mutex_lock(&dev->history_mutex);
   if(pipe->forms) g_list_free_full(pipe->forms, (void (*)(void *))dt_masks_free_form);
   pipe->forms = dt_masks_dup_forms_deep(dev->forms, NULL);
+  dt_pthread_mutex_unlock(&dev->history_mutex);
 
   //  go through list of modules from the end:
   const guint pos = g_list_length(pipe->iop);
@@ -3099,8 +3170,9 @@ gboolean dt_dev_pixelpipe_process(dt_dev_pixelpipe_t *pipe,
 restart:
 
   // check if we should obsolete caches
-  if(pipe->cache_obsolete) dt_dev_pixelpipe_cache_flush(pipe);
-  pipe->cache_obsolete = FALSE;
+  if(pipe->cache_obsolete_order != INT_MAX)
+    dt_dev_pixelpipe_cache_invalidate_later(pipe, pipe->cache_obsolete_order, "pre pixelpipe run");
+  pipe->cache_obsolete_order = INT_MAX;
 
   // mask display off as a starting point
   pipe->mask_display = DT_DEV_PIXELPIPE_DISPLAY_NONE;
@@ -3113,25 +3185,15 @@ restart:
   dt_iop_buffer_dsc_t _out_format = { 0 };
   dt_iop_buffer_dsc_t *out_format = &_out_format;
 
-#ifdef HAVE_OPENCL
-  dt_opencl_check_tuning(pipe->devid);
-  if(pipe->devid > DT_DEVICE_CPU)
-    dt_print_pipe(DT_DEBUG_PIPE, "pipe starting",
-                  pipe, NULL, pipe->devid, &roi, &roi, "'%s' ID=%i, %s using %luMB%s%s",
-                  pipe->image.filename, pipe->image.id,
-                  darktable.opencl->dev[pipe->devid].cname,
-                  darktable.opencl->dev[pipe->devid].used_available / DT_MEGA,
-                  darktable.opencl->dev[pipe->devid].tunehead ? ", tuned" : "",
-                  darktable.opencl->dev[pipe->devid].pinned_memory ? ", pinned": "");
-  else
-    dt_print_pipe(DT_DEBUG_PIPE, "pipe starting",
-                  pipe, NULL, pipe->devid, &roi, &roi, "'%s' ID=%i using %luMB",
-                  pipe->image.filename, pipe->image.id, dt_get_available_mem() / DT_MEGA);
-#else
+  const size_t avail_mem =
+  #ifdef HAVE_OPENCL
+    pipe->devid > DT_DEVICE_CPU ? dt_opencl_get_device_available(pipe->devid) : dt_get_available_mem();
+  #else
+    dt_get_available_mem();
+  #endif
   dt_print_pipe(DT_DEBUG_PIPE, "pipe starting",
-                pipe, NULL, pipe->devid, &roi, &roi, "'%s' ID=%i using %luMB",
-                pipe->image.filename, pipe->image.id, dt_get_available_mem() / DT_MEGA);
-#endif
+                  pipe, NULL, pipe->devid, &roi, &roi, "'%s' ID=%i using %luMB",
+                  pipe->image.filename, pipe->image.id, avail_mem / DT_MEGA);
   dt_print_mem_usage("before pixelpipe process");
 
   // run pixelpipe recursively and get error status
@@ -3220,16 +3282,22 @@ restart:
   //FIXME lock/release cache line instead of copying
   if(dt_pipe_is_screen(pipe))
   {
-    if(pipe->backbuf == NULL
-       || pipe->backbuf_width * pipe->backbuf_height != width * height)
+    // dt_dev_image(want_float) keeps gamma terminal but lets it pass the
+    // 4-channel linear float working RGB through unpacked. In that case the
+    // backbuf is 16 B/px (4 floats) rather than the usual 8-bit ARGB.
+    const size_t bbpp =
+      (pipe->type & DT_DEV_PIXELPIPE_IMAGE_FLOAT) ? 4 * sizeof(float) : 4 * sizeof(uint8_t);
+    if(pipe->backbuf == NULL || pipe->backbuf_width * pipe->backbuf_height != width * height ||
+       pipe->backbuf_size != bbpp * width * height)
     {
       g_free(pipe->backbuf);
-      pipe->backbuf = g_malloc0(sizeof(uint8_t) * 4 * width * height);
+      pipe->backbuf = g_malloc0(bbpp * width * height);
+      pipe->backbuf_size = bbpp * width * height;
     }
 
     if(pipe->backbuf)
     {
-      memcpy(pipe->backbuf, buf, sizeof(uint8_t) * 4 * width * height);
+      memcpy(pipe->backbuf, buf, bbpp * width * height);
       pipe->backbuf_scale = scale;
       for(int i = 0; i < 6; i++) pipe->backbuf_zoom_pos[i] = pts[i] * pipe->iscale;
       pipe->output_imgid = pipe->image.id;

@@ -1,6 +1,6 @@
 /*
     This file is part of darktable,
-    Copyright (C) 2011-2021 darktable developers.
+    Copyright (C) 2011-2026 darktable developers.
 
     darktable is free software: you can redistribute it and/or modify
     it under the terms of the GNU General Public License as published by
@@ -15,6 +15,7 @@
     You should have received a copy of the GNU General Public License
     along with darktable.  If not, see <http://www.gnu.org/licenses/>.
 */
+#include "common/gdk_event_utils.h"
 
 #include "common/ratings.h"
 #include "common/collection.h"
@@ -95,7 +96,7 @@ void gui_init(dt_lib_module_t *self)
 
   /* connect callbacks */
   gtk_widget_set_tooltip_text(drawing, _("set star rating for selected images"));
-  gtk_widget_set_app_paintable(drawing, TRUE);
+  dt_gui_add_class(drawing, "dt_transparent_background");
   g_signal_connect(G_OBJECT(drawing), "draw", G_CALLBACK(_lib_ratings_draw_callback), self);
   g_signal_connect(G_OBJECT(drawing), "button-press-event", G_CALLBACK(_lib_ratings_button_press_callback), self);
   g_signal_connect(G_OBJECT(drawing), "button-release-event", G_CALLBACK(_lib_ratings_button_release_callback),
@@ -184,8 +185,8 @@ static gboolean _lib_ratings_motion_notify_callback(GtkWidget *widget, GdkEventM
 {
   dt_lib_ratings_t *d = self->data;
 
-  d->pointerx = event->x;
-  d->pointery = event->y;
+  d->pointerx = dt_gdk_event_get_x(event);
+  d->pointery = dt_gdk_event_get_y(event);
   gtk_widget_queue_draw(self->widget);
   return TRUE;
 }

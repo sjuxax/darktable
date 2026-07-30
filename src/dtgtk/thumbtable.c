@@ -15,6 +15,7 @@
     You should have received a copy of the GNU General Public License
     along with darktable.  If not, see <http://www.gnu.org/licenses/>.
 */
+#include "common/gdk_event_utils.h"
 /** a class to manage a table of thumbnail for lighttable and filmstrip.  */
 
 #include "dtgtk/thumbtable.h"
@@ -1121,7 +1122,6 @@ static gboolean _event_scroll(GtkWidget *widget,
                               dt_thumbtable_t *table)
 {
   GdkEventScroll *e = (GdkEventScroll *)event;
-  int delta_x, delta_y;
 
   // file manager can either scroll fractionally and smoothly for precision
   // touch pads, or in one-thumbnail increments for clicky scroll wheels,
@@ -1129,16 +1129,25 @@ static gboolean _event_scroll(GtkWidget *widget,
   if(table->mode == DT_THUMBTABLE_MODE_FILEMANAGER
       && !dt_modifier_is(e->state, GDK_CONTROL_MASK))
   {
-    gdouble deltaf_x, deltaf_y;
+    gdouble deltaf = 0.f;
     gboolean did_scroll;
     if(dt_conf_get_bool("thumbtable_fractional_scrolling"))
     {
+      gdouble deltaf_x, deltaf_y;
       did_scroll = dt_gui_get_scroll_deltas(e, &deltaf_x, &deltaf_y);
+      if (did_scroll) {
+        // file manager scroll: tilt right (delta_x >) 0 or scroll down (delta_y > 0) -> down (towards the last image)
+        deltaf = fabs(deltaf_x) > fabs(deltaf_y) ? deltaf_x : deltaf_y;
+      }
     }
     else
     {
+      int delta_x, delta_y;
       did_scroll = dt_gui_get_scroll_unit_deltas(e, &delta_x, &delta_y);
-      deltaf_y = (float)delta_y;
+      if (did_scroll)
+      {
+        deltaf = abs(delta_x) > abs(delta_y) ? delta_x : delta_y;
+      }
     }
     if(did_scroll)
     {
@@ -1148,22 +1157,26 @@ static gboolean _event_scroll(GtkWidget *widget,
       {
         table->scroll_timeout_id = g_timeout_add(10, _event_scroll_compressed, table);
       }
-      table->scroll_value += deltaf_y;
+      table->scroll_value += deltaf;
     }
     // we stop here to avoid scrolledwindow to move
     return TRUE;
   }
 
   // filmstrip and zoom mode always use clicky scroll:
+  int delta_x, delta_y;
+
   if(dt_gui_get_scroll_unit_deltas(e, &delta_x, &delta_y))
   {
     // for zoomable, scroll = zoom
     if(table->mode == DT_THUMBTABLE_MODE_ZOOM
        || dt_modifier_is(e->state, GDK_CONTROL_MASK))
     {
+      // up==right==zoom in
+      const int delta = abs(delta_x) > abs(delta_y) ? -delta_x : delta_y;
       if(table->mode == DT_THUMBTABLE_MODE_FILMSTRIP)
       {
-        const int sx = CLAMP(table->view_width / ((table->view_width / table->thumb_size / 2 + (delta_x+delta_y)) * 2 + 1),
+        const int sx = CLAMP(table->view_width / ((table->view_width / table->thumb_size / 2 + delta) * 2 + 1),
                              dt_conf_get_int("min_panel_height"),
                              dt_conf_get_int("max_panel_height"));
         dt_ui_panel_set_size(darktable.gui->ui, DT_UI_PANEL_BOTTOM, sx);
@@ -1171,13 +1184,15 @@ static gboolean _event_scroll(GtkWidget *widget,
       else
       {
         const int old = dt_view_lighttable_get_zoom(darktable.view_manager);
-        const int new = CLAMP(old + delta_y, 1, DT_LIGHTTABLE_MAX_ZOOM);
+        const int new = CLAMP(old + delta, 1, DT_LIGHTTABLE_MAX_ZOOM);
         dt_thumbtable_zoom_changed(table, old, new);
       }
     }
     else if(table->mode == DT_THUMBTABLE_MODE_FILMSTRIP)
     {
-      _move(table, -(delta_x+delta_y) * (dt_modifier_is(e->state, GDK_SHIFT_MASK)
+      // filmstrip scroll: tilt right (delta_x >) 0 or scroll down (delta_y > 0) -> down (towards the last image)
+      const int delta = abs(delta_x) > abs(delta_y) ? delta_x : delta_y;
+      _move(table, -delta * (dt_modifier_is(e->state, GDK_SHIFT_MASK)
                   ? table->view_width - table->thumb_size
                   : table->thumb_size), 0, TRUE);
 
@@ -1187,7 +1202,7 @@ static gboolean _event_scroll(GtkWidget *widget,
         dt_control_set_mouse_over_id(th->imgid);
     }
   }
-  // we stop here to avoid scrolledwindow to move
+  // we stop here to avoid scrolled window to move
   return TRUE;
 }
 
@@ -1420,10 +1435,10 @@ static gboolean _event_button_press(GtkWidget *widget,
 
   const dt_imgid_t id = dt_control_get_mouse_over_id();
 
-  if(dt_is_valid_imgid(id) && event->button == GDK_BUTTON_PRIMARY)
+  if(dt_is_valid_imgid(id) && dt_gdk_event_get_button(event) == GDK_BUTTON_PRIMARY)
   {
     //  double-click
-    if(event->type == GDK_2BUTTON_PRESS)
+    if(dt_gdk_event_get_type(event) == GDK_2BUTTON_PRESS)
     {
       switch(table->mode)
       {
@@ -1454,12 +1469,12 @@ static gboolean _event_button_press(GtkWidget *widget,
       }
     }
 
-    if(event->type == GDK_BUTTON_PRESS
+    if(dt_gdk_event_get_type(event) == GDK_BUTTON_PRESS
        && table->mode == DT_THUMBTABLE_MODE_FILMSTRIP)
       return FALSE;
   }
 
-  if(event->button == GDK_BUTTON_PRIMARY && event->type == GDK_BUTTON_PRESS)
+  if(dt_gdk_event_get_button(event) == GDK_BUTTON_PRIMARY && dt_gdk_event_get_type(event) == GDK_BUTTON_PRESS)
   {
     // make sure any edition field loses the focus
     gtk_widget_grab_focus(dt_ui_center(darktable.gui->ui));
@@ -1467,8 +1482,8 @@ static gboolean _event_button_press(GtkWidget *widget,
 
   if(table->mode != DT_THUMBTABLE_MODE_ZOOM
      && !dt_is_valid_imgid(id)
-     && event->button == GDK_BUTTON_PRIMARY
-     && event->type == GDK_BUTTON_PRESS)
+     && dt_gdk_event_get_button(event) == GDK_BUTTON_PRIMARY
+     && dt_gdk_event_get_type(event) == GDK_BUTTON_PRESS)
   {
     const dt_view_type_flags_t cv = dt_view_get_current();
 
@@ -1485,8 +1500,8 @@ static gboolean _event_button_press(GtkWidget *widget,
     }
 
     PangoRectangle *button = &table->manual_button;
-    if(event->x < button->x && event->x > button->x - button->width
-       && event->y < button->y && event->y > button->y - button->height)
+    if(dt_gdk_event_get_x(event) < button->x && dt_gdk_event_get_x(event) > button->x - button->width
+       && dt_gdk_event_get_y(event) < button->y && dt_gdk_event_get_y(event) > button->y - button->height)
     {
       dt_gui_show_help(NULL);
     }
@@ -1497,7 +1512,7 @@ static gboolean _event_button_press(GtkWidget *widget,
   if(table->mode != DT_THUMBTABLE_MODE_ZOOM)
     return TRUE;
 
-  if(event->button == GDK_BUTTON_PRIMARY && event->type == GDK_BUTTON_PRESS)
+  if(dt_gdk_event_get_button(event) == GDK_BUTTON_PRIMARY && dt_gdk_event_get_type(event) == GDK_BUTTON_PRESS)
   {
     table->dragging = TRUE;
     table->drag_dx = table->drag_dy = 0;
@@ -1520,14 +1535,14 @@ static gboolean _event_motion_notify(GtkWidget *widget,
   gboolean ret = FALSE;
   if(table->dragging && table->mode == DT_THUMBTABLE_MODE_ZOOM)
   {
-    const int dx = ceil(event->x_root) - table->last_x;
-    const int dy = ceil(event->y_root) - table->last_y;
+    const int dx = ceil(dt_gdk_event_get_root_x(event)) - table->last_x;
+    const int dy = ceil(dt_gdk_event_get_root_y(event)) - table->last_y;
     _move(table, dx, dy, TRUE);
     table->drag_dx += dx;
     table->drag_dy += dy;
     if(table->drag_thumb && !table->drag_thumb->moved)
     {
-      // we only considers that this is a real move if the total
+      // we only consider that this is a real move if the total
       // distance is not too low
       table->drag_thumb->moved =
         ((abs(table->drag_dx) + abs(table->drag_dy)) > DT_PIXEL_APPLY_DPI(8));
@@ -1535,8 +1550,8 @@ static gboolean _event_motion_notify(GtkWidget *widget,
     ret = TRUE;
   }
 
-  table->last_x = ceil(event->x_root);
-  table->last_y = ceil(event->y_root);
+  table->last_x = ceil(dt_gdk_event_get_root_x(event));
+  table->last_y = ceil(dt_gdk_event_get_root_y(event));
   return ret;
 }
 
@@ -1557,15 +1572,15 @@ static gboolean _event_button_release(GtkWidget *widget,
   const dt_imgid_t id = dt_control_get_mouse_over_id();
 
   if(dt_is_valid_imgid(id)
-     && event->button == GDK_BUTTON_PRIMARY
-     && event->type == GDK_BUTTON_RELEASE)
+     && dt_gdk_event_get_button(event) == GDK_BUTTON_PRIMARY
+     && dt_gdk_event_get_type(event) == GDK_BUTTON_RELEASE)
   {
-    if(dt_modifier_is(event->state, GDK_CONTROL_MASK)
-       || dt_modifier_is(event->state, GDK_MOD2_MASK)) // CMD key on macOS
+    if(dt_modifier_is(dt_gdk_event_get_state(event), GDK_CONTROL_MASK)
+       || dt_modifier_is(dt_gdk_event_get_state(event), GDK_MOD2_MASK)) // CMD key on macOS
     {
       dt_selection_toggle(darktable.selection, id);
     }
-    else if(dt_modifier_is(event->state, GDK_SHIFT_MASK))
+    else if(dt_modifier_is(dt_gdk_event_get_state(event), GDK_SHIFT_MASK))
     {
       dt_selection_select_range(darktable.selection, id);
     }
@@ -2559,7 +2574,7 @@ dt_thumbtable_t *dt_thumbtable_new()
                         | GDK_BUTTON_PRESS_MASK | GDK_BUTTON_RELEASE_MASK
                         | GDK_STRUCTURE_MASK
                         | GDK_ENTER_NOTIFY_MASK | GDK_LEAVE_NOTIFY_MASK);
-  gtk_widget_set_app_paintable(table->widget, TRUE);
+  dt_gui_add_class(table->widget, "dt_transparent_background");
   gtk_widget_set_can_focus(table->widget, TRUE);
 
   // drag and drop : used for reordering, interactions with maps,

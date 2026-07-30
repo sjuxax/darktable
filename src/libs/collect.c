@@ -15,6 +15,7 @@
     You should have received a copy of the GNU General Public License
     along with darktable.  If not, see <http://www.gnu.org/licenses/>.
 */
+#include "common/gdk_event_utils.h"
 
 #include "libs/collect.h"
 #include "bauhaus/bauhaus.h"
@@ -638,27 +639,27 @@ static gboolean view_onButtonPressed(GtkWidget *treeview,
   /* Get tree path for row that was clicked */
   GtkTreePath *path = NULL;
   const gboolean get_path = gtk_tree_view_get_path_at_pos(GTK_TREE_VIEW(treeview),
-                                                          (gint)event->x, (gint)event->y,
+                                                          (gint)dt_gdk_event_get_x(event), (gint)dt_gdk_event_get_y(event),
                                                           &path, NULL, NULL, NULL);
 
-  if(event->type == GDK_DOUBLE_BUTTON_PRESS || d->singleclick)
+  if(dt_gdk_event_get_type(event) == GDK_DOUBLE_BUTTON_PRESS || d->singleclick)
   {
-    if(event->state == last_state && path)
+    if(dt_gdk_event_get_state(event) == last_state && path)
     {
       if(gtk_tree_view_row_expanded(GTK_TREE_VIEW(treeview), path))
         gtk_tree_view_collapse_row(GTK_TREE_VIEW(treeview), path);
       else
         gtk_tree_view_expand_row(GTK_TREE_VIEW(treeview), path, FALSE);
     }
-    last_state = event->state;
+    last_state = dt_gdk_event_get_state(event);
   }
 
   // case of a range selection
   GtkTreeSelection *selection = gtk_tree_view_get_selection(GTK_TREE_VIEW(treeview));
-  if(get_path && dt_modifier_is(event->state, GDK_SHIFT_MASK)
+  if(get_path && dt_modifier_is(dt_gdk_event_get_state(event), GDK_SHIFT_MASK)
      && gtk_tree_selection_count_selected_rows(selection) > 0
      && (d->view_rule == DT_COLLECTION_PROP_DAY
-         || d->view_rule == DT_COLLECTION_PROP_MONTH 
+         || d->view_rule == DT_COLLECTION_PROP_MONTH
          || _is_time_property(d->view_rule)
          || d->view_rule == DT_COLLECTION_PROP_APERTURE
          || d->view_rule == DT_COLLECTION_PROP_FOCAL_LENGTH
@@ -692,9 +693,9 @@ static gboolean view_onButtonPressed(GtkWidget *treeview,
   // case of a context-menu (folder/filmroll)
   if(((d->view_rule == DT_COLLECTION_PROP_FOLDERS)
       || (d->view_rule == DT_COLLECTION_PROP_FILMROLL))
-     && (event->type == GDK_BUTTON_PRESS && event->button == GDK_BUTTON_SECONDARY)
-     && !(dt_modifier_is(event->state, GDK_SHIFT_MASK)
-          || dt_modifier_is(event->state, GDK_CONTROL_MASK)))
+     && (dt_gdk_event_get_type(event) == GDK_BUTTON_PRESS && dt_gdk_event_get_button(event) == GDK_BUTTON_SECONDARY)
+     && !(dt_modifier_is(dt_gdk_event_get_state(event), GDK_SHIFT_MASK)
+          || dt_modifier_is(dt_gdk_event_get_state(event), GDK_CONTROL_MASK)))
   {
     row_activated_with_event(GTK_TREE_VIEW(treeview), path, NULL, event, d);
     view_popup_menu(treeview, event, d);
@@ -704,13 +705,13 @@ static gboolean view_onButtonPressed(GtkWidget *treeview,
   }
 
   // case of a activation
-  if((!d->singleclick && event->type == GDK_2BUTTON_PRESS && event->button == GDK_BUTTON_PRIMARY)
-     || (d->singleclick && event->type == GDK_BUTTON_PRESS && event->button == GDK_BUTTON_PRIMARY)
-     || (!d->singleclick && event->type == GDK_BUTTON_PRESS && event->button == GDK_BUTTON_PRIMARY
-         && (dt_modifier_is(event->state, GDK_SHIFT_MASK)
-             || dt_modifier_is(event->state, GDK_CONTROL_MASK)))
+  if((!d->singleclick && dt_gdk_event_get_type(event) == GDK_2BUTTON_PRESS && dt_gdk_event_get_button(event) == GDK_BUTTON_PRIMARY)
+     || (d->singleclick && dt_gdk_event_get_type(event) == GDK_BUTTON_PRESS && dt_gdk_event_get_button(event) == GDK_BUTTON_PRIMARY)
+     || (!d->singleclick && dt_gdk_event_get_type(event) == GDK_BUTTON_PRESS && dt_gdk_event_get_button(event) == GDK_BUTTON_PRIMARY
+         && (dt_modifier_is(dt_gdk_event_get_state(event), GDK_SHIFT_MASK)
+             || dt_modifier_is(dt_gdk_event_get_state(event), GDK_CONTROL_MASK)))
      || (d->view_rule == DT_COLLECTION_PROP_MONTH
-         && event->type == GDK_BUTTON_PRESS && event->button == GDK_BUTTON_PRIMARY))
+         && dt_gdk_event_get_type(event) == GDK_BUTTON_PRESS && dt_gdk_event_get_button(event) == GDK_BUTTON_PRIMARY))
   {
     row_activated_with_event(GTK_TREE_VIEW(treeview), path, NULL, event, d);
 
@@ -1381,6 +1382,25 @@ static void _expand_select_tree_path(GtkTreePath *path1,
 
 static const char *UNCATEGORIZED_TAG = N_("uncategorized");
 
+static void _update_parent_count(GtkTreeModel *model,
+                                 GtkTreeIter *iter,
+                                 const int count)
+{
+  GtkTreeIter parent = *iter;
+  GtkTreeIter child;
+  guint parentcount;
+
+  do
+  {
+    gtk_tree_model_get(model, &parent,
+                       DT_LIB_COLLECT_COL_COUNT, &parentcount, -1);
+
+    gtk_tree_store_set(GTK_TREE_STORE(model), &parent,
+                       DT_LIB_COLLECT_COL_COUNT, parentcount + count, -1);
+    child = parent;
+  } while (gtk_tree_model_iter_parent(model, &parent, &child));
+}
+
 static void _tree_view(dt_lib_collect_rule_t *dr)
 {
   // update related list
@@ -1673,6 +1693,7 @@ static void _tree_view(dt_lib_collect_rule_t *dr)
       char *name = tuple->name;
       const int count = tuple->count;
       const int status = tuple->status;
+
       if(name == NULL) continue; // safeguard against degenerated db entries
 
       // this is just for tags
@@ -1727,7 +1748,8 @@ static void _tree_view(dt_lib_collect_rule_t *dr)
 
         if(tokens != NULL)
         {
-          // find the number of common parts at the beginning of tokens and last_tokens
+          // find the number of common parts at the beginning of tokens and
+          // last_tokens
           GtkTreeIter parent = last_parent;
           const int tokens_length = string_array_length(tokens);
           int common_length = 0;
@@ -1739,7 +1761,6 @@ static void _tree_view(dt_lib_collect_rule_t *dr)
             {
               common_length++;
             }
-
             // point parent iter to where the entries should be added
             for(int i = common_length; i < last_tokens_length; i++)
             {
@@ -1756,6 +1777,14 @@ static void _tree_view(dt_lib_collect_rule_t *dr)
 #endif
           for(int i = 0; i < common_length; i++)
             dt_util_str_cat(&pth, format_separator, tokens[i]);
+
+          // if we are at the end of the path, and this is a folder, we need to
+          // add the count to all parents.
+          if(!tokens[common_length]
+             && property == DT_COLLECTION_PROP_FOLDERS)
+          {
+            _update_parent_count(model, &parent, count);
+          }
 
           for(char **token = &tokens[common_length]; *token; token++)
           {
@@ -1776,19 +1805,12 @@ static void _tree_view(dt_lib_collect_rule_t *dr)
             index++;
             // also add the item count to parents
             if((property == DT_COLLECTION_PROP_DAY
+                || property == DT_COLLECTION_PROP_FOLDERS
                 || _is_time_property(property)) && !*(token + 1))
             {
-              guint parentcount;
-              GtkTreeIter parent2, child = iter;
-
-              while(gtk_tree_model_iter_parent(model, &parent2, &child))
-              {
-                gtk_tree_model_get(model, &parent2,
-                                   DT_LIB_COLLECT_COL_COUNT, &parentcount, -1);
-                gtk_tree_store_set(GTK_TREE_STORE(model), &parent2,
-                                   DT_LIB_COLLECT_COL_COUNT, count + parentcount, -1);
-                child = parent2;
-              }
+              GtkTreeIter p;
+              gtk_tree_model_iter_parent(model, &p, &iter);
+              _update_parent_count(model, &p, count);
             }
 
             common_length++;
@@ -2328,7 +2350,7 @@ static void _list_view(dt_lib_collect_rule_t *dr)
     if(strlen(query) > 0)
     {
       DT_DEBUG_SQLITE3_PREPARE_V2(dt_database_get(darktable.db), query, -1, &stmt, NULL);
-      
+
       GList *rows = NULL;
 
       while(sqlite3_step(stmt) == SQLITE_ROW)
@@ -2438,11 +2460,11 @@ static void _list_view(dt_lib_collect_rule_t *dr)
       {
         const gboolean sort_by_import_time =
           dt_conf_is_equal("plugins/collect/filmroll_sort", "import time");
-        const gboolean sort_by_folder_name = 
+        const gboolean sort_by_folder_name =
           dt_conf_is_equal("plugins/collect/filmroll_sort", "folder name");
-      
+
         if(sort_by_import_time)
-        {      
+        {
           rows = g_list_sort(rows, _sort_filmroll_by_id);
         }
         else if(sort_by_folder_name)
@@ -2453,21 +2475,21 @@ static void _list_view(dt_lib_collect_rule_t *dr)
         {
           rows = g_list_sort(rows, _sort_filmroll_by_display_name);
         }
-      
+
         if(sort_descending)
           rows = g_list_reverse(rows);
-      
+
         for(GList *l = rows; l; l = l->next)
         {
           filmroll_row_t *r = l->data;
-      
+
           gchar *text = g_strdup(r->value);
           gchar *ptr = text;
           while(!g_utf8_validate(ptr, -1, (const gchar **)&ptr))
             ptr[0] = '?';
-      
+
           gchar *escaped_text = g_markup_escape_text(text, -1);
-      
+
           gtk_list_store_insert_with_values(GTK_LIST_STORE(model), NULL, -1,
                                             DT_LIB_COLLECT_COL_TEXT, r->folder,
                                             DT_LIB_COLLECT_COL_ID, r->id,
@@ -2477,14 +2499,14 @@ static void _list_view(dt_lib_collect_rule_t *dr)
                                             DT_LIB_COLLECT_COL_COUNT, r->count,
                                             DT_LIB_COLLECT_COL_UNREACHABLE, r->status,
                                             -1);
-      
+
           g_free(text);
           g_free(escaped_text);
           g_free(r->folder);
           g_free(r->value);
           g_free(r);
         }
-      
+
         g_list_free(rows);
         rows = NULL;
       }
@@ -2786,18 +2808,187 @@ void gui_reset(dt_lib_module_t *self)
                              DT_COLLECTION_PROP_UNDEF, NULL);
 }
 
+// Returns TRUE if the folder still corresponds to at least one film roll,
+// either directly or as an ancestor of one. This mirrors the folders tree,
+// where a node exists as long as a film roll lives at or below it.
+static gboolean _folder_exists(const char *folder)
+{
+  if(!folder || !*folder) return FALSE;
+
+  gboolean exists = FALSE;
+  sqlite3_stmt *stmt = NULL;
+  gchar *child = g_strconcat(folder, G_DIR_SEPARATOR_S, "%", NULL);
+  DT_DEBUG_SQLITE3_PREPARE_V2
+    (dt_database_get(darktable.db),
+     "SELECT 1 FROM main.film_rolls WHERE folder = ?1 OR folder LIKE ?2 LIMIT 1",
+     -1, &stmt, NULL);
+  DT_DEBUG_SQLITE3_BIND_TEXT(stmt, 1, folder, -1, SQLITE_TRANSIENT);
+  DT_DEBUG_SQLITE3_BIND_TEXT(stmt, 2, child, -1, SQLITE_TRANSIENT);
+  if(sqlite3_step(stmt) == SQLITE_ROW) exists = TRUE;
+  sqlite3_finalize(stmt);
+  g_free(child);
+  return exists;
+}
+
+// Resolve a folder path to the film roll that best corresponds to it, so
+// that switching from the folders to the film roll view keeps the user near
+// where they were instead of forcing them to retraverse the tree.
+// Returns a newly allocated film roll folder path, or NULL if none exists.
+// Preference order: an exact match (1:1), else the closest film roll that
+// contains the folder (nearest ancestor), else the closest film roll
+// contained in the folder (nearest descendant).
+static gchar *_filmroll_for_folder(const char *folder)
+{
+  if(!folder || !*folder) return NULL;
+
+  gchar *result = NULL;
+  sqlite3_stmt *stmt = NULL;
+
+  // 1:1 exact match
+  DT_DEBUG_SQLITE3_PREPARE_V2
+    (dt_database_get(darktable.db),
+     "SELECT folder FROM main.film_rolls WHERE folder = ?1", -1, &stmt, NULL);
+  DT_DEBUG_SQLITE3_BIND_TEXT(stmt, 1, folder, -1, SQLITE_TRANSIENT);
+  if(sqlite3_step(stmt) == SQLITE_ROW)
+    result = g_strdup((const char *)sqlite3_column_text(stmt, 0));
+  sqlite3_finalize(stmt);
+  if(result) return result;
+
+  // closest containing film roll (nearest ancestor)
+  DT_DEBUG_SQLITE3_PREPARE_V2
+    (dt_database_get(darktable.db),
+     "SELECT folder FROM main.film_rolls"
+     " WHERE ?1 LIKE folder || ?2"
+     " ORDER BY LENGTH(folder) DESC LIMIT 1", -1, &stmt, NULL);
+  DT_DEBUG_SQLITE3_BIND_TEXT(stmt, 1, folder, -1, SQLITE_TRANSIENT);
+  DT_DEBUG_SQLITE3_BIND_TEXT(stmt, 2, G_DIR_SEPARATOR_S "%", -1, SQLITE_TRANSIENT);
+  if(sqlite3_step(stmt) == SQLITE_ROW)
+    result = g_strdup((const char *)sqlite3_column_text(stmt, 0));
+  sqlite3_finalize(stmt);
+  if(result) return result;
+
+  // closest contained film roll (nearest descendant)
+  gchar *child_pattern = g_strconcat(folder, G_DIR_SEPARATOR_S, "%", NULL);
+  DT_DEBUG_SQLITE3_PREPARE_V2
+    (dt_database_get(darktable.db),
+     "SELECT folder FROM main.film_rolls"
+     " WHERE folder LIKE ?1"
+     " ORDER BY LENGTH(folder) ASC LIMIT 1", -1, &stmt, NULL);
+  DT_DEBUG_SQLITE3_BIND_TEXT(stmt, 1, child_pattern, -1, SQLITE_TRANSIENT);
+  if(sqlite3_step(stmt) == SQLITE_ROW)
+    result = g_strdup((const char *)sqlite3_column_text(stmt, 0));
+  sqlite3_finalize(stmt);
+  g_free(child_pattern);
+
+  return result;
+}
+
+// Strip the folders-collection suffixes (`*`, `|%`, trailing separator or
+// `%`) from a rule value to recover a plain filesystem path. Returns a
+// newly allocated string.
+static gchar *_folder_plain_path(const char *text)
+{
+  gchar *folder = g_strdup(text ? text : "");
+  size_t len = strlen(folder);
+  if(len && folder[len - 1] == '*') folder[--len] = '\0';
+  if(len >= 2 && g_str_has_suffix(folder, "|%")) { len -= 2; folder[len] = '\0'; }
+  while(len && (folder[len - 1] == G_DIR_SEPARATOR || folder[len - 1] == '%'))
+    folder[--len] = '\0';
+  return folder;
+}
+
+// When a filesystem operation (move/delete/erase) removes the film roll or
+// folder the active rule points at, repoint it at the closest still existing
+// entry instead of letting the collection module collapse back to the tree
+// root. The selection is left untouched while its target still exists.
+// Returns TRUE if the rule's stored value was changed.
+static gboolean _fixup_stale_selection(dt_lib_collect_t *d)
+{
+  const int active = d->active_rule;
+  const int property = _combo_get_active_collection(d->rule[active].combo);
+
+  if(property != DT_COLLECTION_PROP_FILMROLL
+     && property != DT_COLLECTION_PROP_FOLDERS)
+    return FALSE;
+
+  char confname[200] = { 0 };
+  snprintf(confname, sizeof(confname),
+           "plugins/lighttable/collect/string%1d", active);
+  gchar *text = dt_conf_get_string(confname);
+  if(!text || !text[0])
+  {
+    g_free(text);
+    return FALSE;
+  }
+
+  gchar *folder = _folder_plain_path(text);
+  gboolean changed = FALSE;
+
+  // a folder node survives as long as a film roll lives at or under it, so we
+  // only repoint when it has vanished entirely; film rolls are an exact match
+  // and _filmroll_for_folder() returns the path unchanged while it exists.
+  if(property != DT_COLLECTION_PROP_FOLDERS || !_folder_exists(folder))
+  {
+    gchar *closest = _filmroll_for_folder(folder);
+    if(g_strcmp0(closest, folder) != 0)
+    {
+      dt_conf_set_string(confname, closest ? closest : "");
+      changed = TRUE;
+    }
+    g_free(closest);
+  }
+
+  g_free(folder);
+  g_free(text);
+  return changed;
+}
+
 static void combo_changed(GtkWidget *combo,
                           dt_lib_collect_rule_t *d)
 {
   DT_GUARD_GUI_UPDATE();
-  g_signal_handlers_block_matched(d->text, G_SIGNAL_MATCH_FUNC, 0, 0, NULL,
-                                  entry_changed, NULL);
-  gtk_entry_set_text(GTK_ENTRY(d->text), "");
-  g_signal_handlers_unblock_matched(d->text, G_SIGNAL_MATCH_FUNC, 0, 0, NULL,
-                                    entry_changed, NULL);
   dt_lib_collect_t *c = get_collect(d);
   c->active_rule = d->num;
   const int property = _combo_get_active_collection(d->combo);
+
+  // When switching between the film roll and folders views, both store the
+  // full folder path as their value, so we carry the current selection over
+  // instead of forcing the user to retraverse the tree to find where they
+  // were.
+  // - film roll -> folders: keep the path verbatim (same exact-match query,
+  //   the displayed collection is left unchanged and the tree opens there).
+  // - folders -> film roll: resolve the folder to the closest film roll
+  //   (1:1 match, else nearest containing/contained film roll).
+  char confname[200] = { 0 };
+  snprintf(confname, sizeof(confname),
+           "plugins/lighttable/collect/item%1d", d->num);
+  const int prev_property = dt_conf_get_int(confname);
+  const gchar *cur_text = gtk_entry_get_text(GTK_ENTRY(d->text));
+  const gboolean has_text = cur_text && cur_text[0];
+
+  const gboolean keep_path = prev_property == DT_COLLECTION_PROP_FILMROLL
+                             && property == DT_COLLECTION_PROP_FOLDERS
+                             && has_text;
+
+  gchar *resolved_filmroll = NULL;
+  if(prev_property == DT_COLLECTION_PROP_FOLDERS
+     && property == DT_COLLECTION_PROP_FILMROLL
+     && has_text)
+  {
+    gchar *folder = _folder_plain_path(cur_text);
+    resolved_filmroll = _filmroll_for_folder(folder);
+    g_free(folder);
+  }
+
+  g_signal_handlers_block_matched(d->text, G_SIGNAL_MATCH_FUNC, 0, 0, NULL,
+                                  entry_changed, NULL);
+  if(resolved_filmroll)
+    gtk_entry_set_text(GTK_ENTRY(d->text), resolved_filmroll);
+  else if(!keep_path)
+    gtk_entry_set_text(GTK_ENTRY(d->text), "");
+  g_signal_handlers_unblock_matched(d->text, G_SIGNAL_MATCH_FUNC, 0, 0, NULL,
+                                    entry_changed, NULL);
+  g_free(resolved_filmroll);
 
   if(property == DT_COLLECTION_PROP_FOLDERS
      || property == DT_COLLECTION_PROP_TAG
@@ -2813,8 +3004,6 @@ static void combo_changed(GtkWidget *combo,
   gchar *order = NULL;
   if(c->active_rule == 0)
   {
-    const int prev_property = dt_conf_get_int("plugins/lighttable/collect/item0");
-
     if(prev_property != DT_COLLECTION_PROP_TAG
        && property == DT_COLLECTION_PROP_TAG)
     {
@@ -2875,7 +3064,7 @@ static void row_activated_with_event(GtkTreeView *view,
 
   if(text && strlen(text) > 0)
   {
-    if(dt_modifier_is(event->state, GDK_SHIFT_MASK | GDK_CONTROL_MASK))
+    if(dt_modifier_is(dt_gdk_event_get_state(event), GDK_SHIFT_MASK | GDK_CONTROL_MASK))
     {
       if(item == DT_COLLECTION_PROP_FILMROLL)
       {
@@ -2927,7 +3116,7 @@ static void row_activated_with_event(GtkTreeView *view,
       {
         /* if a tag has children, ctrl-clicking on a parent node
          * should display all images under this hierarchy. */
-        if(dt_modifier_is(event->state, GDK_CONTROL_MASK))
+        if(dt_modifier_is(dt_gdk_event_get_state(event), GDK_CONTROL_MASK))
         {
           gchar *n_text = g_strconcat(text, "|%", NULL);
           g_free(text);
@@ -2935,7 +3124,7 @@ static void row_activated_with_event(GtkTreeView *view,
         }
         /* if a tag has children, left-clicking on a parent node
          * should display all images in and under this hierarchy. */
-        else if(!dt_modifier_is(event->state, GDK_SHIFT_MASK))
+        else if(!dt_modifier_is(dt_gdk_event_get_state(event), GDK_SHIFT_MASK))
         {
           gchar *n_text = g_strconcat(text, "*", NULL);
           g_free(text);
@@ -3137,9 +3326,14 @@ static void collection_updated(gpointer instance,
   d->view_rule = -1;
   d->rule[d->active_rule].typing = FALSE;
 
+  // if a move/delete/erase removed the selected film roll/folder, repoint the
+  // rule at the closest survivor so we don't collapse back to the tree root
+  const gboolean repointed = _fixup_stale_selection(d);
+
   // determine if we want to refresh the tree or not
   gboolean refresh = TRUE;
-  if(query_change == DT_COLLECTION_CHANGE_RELOAD
+  if(!repointed
+     && query_change == DT_COLLECTION_CHANGE_RELOAD
      && changed_property != DT_COLLECTION_PROP_UNDEF)
   {
     // if we only reload the collection, that means that we don't
@@ -3159,6 +3353,19 @@ static void collection_updated(gpointer instance,
 
   if(refresh)
     _lib_collect_gui_update(self);
+
+  if(repointed)
+  {
+    // the collection was queried from the now-stale rule; re-run it from the
+    // corrected value so the displayed images follow the new selection. Block
+    // ourselves to avoid recursing through this same handler.
+    dt_control_signal_block_by_func(darktable.signals, G_CALLBACK(collection_updated),
+                                    darktable.view_manager->proxy.module_collect.module);
+    dt_collection_update_query(darktable.collection, DT_COLLECTION_CHANGE_NEW_QUERY,
+                               DT_COLLECTION_PROP_UNDEF, NULL);
+    dt_control_signal_unblock_by_func(darktable.signals, G_CALLBACK(collection_updated),
+                                      darktable.view_manager->proxy.module_collect.module);
+  }
 }
 
 
@@ -3387,7 +3594,7 @@ static gboolean popup_button_callback(GtkWidget *widget,
                                       GdkEventButton *event,
                                       dt_lib_collect_rule_t *d)
 {
-  if(event->button != 1)
+  if(dt_gdk_event_get_button(event) != 1)
     return FALSE;
 
   GtkWidget *menu = gtk_menu_new();

@@ -15,6 +15,7 @@
     You should have received a copy of the GNU General Public License
     along with darktable.  If not, see <http://www.gnu.org/licenses/>.
 */
+#include "common/gdk_event_utils.h"
 /** this is the view for the darkroom module.  */
 
 #include "common/extra_optimizations.h"
@@ -27,7 +28,9 @@
 #include "common/file_location.h"
 #include "common/focus_peaking.h"
 #include "common/history.h"
+#include "common/image.h"
 #include "common/image_cache.h"
+#include "common/metadata.h"
 #include "common/overlay.h"
 #include "common/selection.h"
 #include "common/styles.h"
@@ -532,6 +535,129 @@ static void _view_paint_surface(cairo_t *cr,
   dt_pthread_mutex_unlock(&p->backbuf_mutex);
 }
 
+/* drag&drop hint overlays
+   When an external file drag enters the darkroom, we paint a hint on the
+   center view ("drop XMP sidecars here") and on the filmstrip ("drop images
+   here"). We can only detect the drag once its pointer enters one of our drop
+   targets (the app isn't focused when the drag starts), so the state is driven
+   by the "drag-motion"/"drag-leave" signals of those two widgets. */
+static gboolean _darkroom_dnd_active = FALSE;
+static guint _darkroom_dnd_clear_timeout = 0;
+
+static void _darkroom_dnd_queue_redraw(void)
+{
+  gtk_widget_queue_draw(dt_ui_center(darktable.gui->ui));
+  const dt_thumbtable_t *tt = dt_ui_thumbtable(darktable.gui->ui);
+  if(tt)
+    gtk_widget_queue_draw(tt->widget);
+}
+
+static void _darkroom_dnd_set_active(const gboolean active)
+{
+  if(_darkroom_dnd_active == active)
+    return;
+  _darkroom_dnd_active = active;
+  _darkroom_dnd_queue_redraw();
+}
+
+static gboolean _darkroom_dnd_clear_timeout_cb(gpointer user_data)
+{
+  _darkroom_dnd_clear_timeout = 0;
+  _darkroom_dnd_set_active(FALSE);
+  return G_SOURCE_REMOVE;
+}
+
+static void _darkroom_dnd_stop(void)
+{
+  if(_darkroom_dnd_clear_timeout)
+  {
+    g_source_remove(_darkroom_dnd_clear_timeout);
+    _darkroom_dnd_clear_timeout = 0;
+  }
+  _darkroom_dnd_set_active(FALSE);
+}
+
+// whether the drag comes from outside the application (a file manager) rather
+// than being an internal thumbnail or module reorder - only external file drags
+// should trigger the hint. We key off the (absent) in-app source widget rather
+// than the offered targets, as macOS doesn't reliably expose those during
+// drag-motion (they only resolve at drop time).
+static gboolean _darkroom_dnd_is_external(GdkDragContext *context)
+{
+  return gtk_drag_get_source_widget(context) == NULL;
+}
+
+// arm the hint while a file drag hovers the center view or the filmstrip
+static gboolean _darkroom_dnd_motion(GtkWidget *widget,
+                                     GdkDragContext *context,
+                                     const gint x,
+                                     const gint y,
+                                     const guint time,
+                                     gpointer user_data)
+{
+  if(_darkroom_dnd_is_external(context))
+  {
+    if(_darkroom_dnd_clear_timeout)
+    {
+      g_source_remove(_darkroom_dnd_clear_timeout);
+      _darkroom_dnd_clear_timeout = 0;
+    }
+    _darkroom_dnd_set_active(TRUE);
+  }
+  return FALSE; // let the widget's default destination handler accept the drop
+}
+
+// disarm the hint, but with a small delay so moving the drag between the
+// center and the filmstrip (leave on one immediately followed by motion on the
+// other) doesn't make it flicker
+static void _darkroom_dnd_leave(GtkWidget *widget,
+                                GdkDragContext *context,
+                                const guint time,
+                                gpointer user_data)
+{
+  if(_darkroom_dnd_active && !_darkroom_dnd_clear_timeout)
+    _darkroom_dnd_clear_timeout = g_timeout_add(200, _darkroom_dnd_clear_timeout_cb, NULL);
+}
+
+// paint a dimmed overlay with a centered hint label
+static void
+_darkroom_draw_dnd_hint(cairo_t *cr, const int width, const int height, const char *text)
+{
+  cairo_save(cr);
+  cairo_set_source_rgba(cr, 0.0, 0.0, 0.0, 0.5);
+  cairo_rectangle(cr, 0, 0, width, height);
+  cairo_fill(cr);
+
+  PangoFontDescription *desc =
+    pango_font_description_copy_static(darktable.bauhaus->pango_font_desc);
+  pango_font_description_set_weight(desc, PANGO_WEIGHT_BOLD);
+  pango_font_description_set_absolute_size(desc, DT_PIXEL_APPLY_DPI(18) * PANGO_SCALE);
+  PangoLayout *layout = pango_cairo_create_layout(cr);
+  pango_layout_set_font_description(layout, desc);
+  pango_layout_set_text(layout, text, -1);
+  PangoRectangle ink, logical;
+  pango_layout_get_pixel_extents(layout, &ink, &logical);
+  cairo_move_to(cr, (width - logical.width) * 0.5, (height - logical.height) * 0.5);
+  cairo_set_source_rgb(cr, 0.9, 0.9, 0.9);
+  pango_cairo_show_layout(cr, layout);
+
+  pango_font_description_free(desc);
+  g_object_unref(layout);
+  cairo_restore(cr);
+}
+
+// connected (after) to the filmstrip thumbtable "draw" so the hint paints on
+// top of the thumbnails
+static gboolean _darkroom_filmstrip_draw_hint(GtkWidget *widget, cairo_t *cr, gpointer user_data)
+{
+  if(_darkroom_dnd_active)
+    _darkroom_draw_dnd_hint(cr,
+                            gtk_widget_get_allocated_width(widget),
+                            gtk_widget_get_allocated_height(widget),
+                            _("drop image files here to add them to the collection"));
+  return FALSE;
+}
+
 void expose(dt_view_t *self,
             cairo_t *cri,
             const int32_t width,
@@ -561,7 +687,14 @@ void expose(dt_view_t *self,
   float zoom_x, zoom_y, boxw, boxh;
   float zbound_x = FLT_MAX, zbound_y = 0.0f;
   if(!dt_dev_get_zoom_bounds(port, &zoom_x, &zoom_y, &boxw, &boxh))
+  {
+    // get_zoom_bounds reports no scrollable bounds at fit / when the image
+    // fits the viewport, but the viewport may still be panned off-centre to
+    // reach mask nodes outside the image. Use the actual stored centre (0
+    // when not panned) so that pan is rendered; the box spans the full image.
+    dt_dev_get_viewport_params(port, NULL, NULL, &zoom_x, &zoom_y);
     boxw = boxh = 1.0f;
+  }
   else
   {
     zbound_x = zoom_x;
@@ -572,31 +705,41 @@ void expose(dt_view_t *self,
       because adding a slider will change the image area and might
       force a resizing in next expose.  So we disable in cases close
       to full.
+
+      This near-fit centring is applied only to the values handed to the
+      scrollbar; the real zoom_x/zoom_y are kept for rendering so the mask
+      overlay (and guides/pickers) follow the image exactly even when the
+      user has deliberately panned off-canvas below the fit zoom to reach
+      mask handles outside the image. Zeroing them here would pin the
+      overlay at the image centre while the image itself (and raster mask
+      overlay) follow the pan, breaking alignment below fit.
   */
+  float sb_zoom_x = zoom_x, sb_zoom_y = zoom_y, sb_boxw = boxw, sb_boxh = boxh;
   if(boxw > 0.95f)
   {
-    zoom_x = .0f;
-    boxw = 1.01f;
+    sb_zoom_x = .0f;
+    sb_boxw = 1.01f;
   }
   if(boxh > 0.95f)
   {
-    zoom_y = .0f;
-    boxh = 1.01f;
+    sb_zoom_y = .0f;
+    sb_boxh = 1.01f;
   }
 
-  dt_view_set_scrollbar(self, zoom_x, -0.5 + boxw/2, 0.5,
-                        boxw/2, zoom_y, -0.5+ boxh/2, 0.5, boxh/2);
+  dt_view_set_scrollbar(self,
+                        sb_zoom_x,
+                        -0.5 + sb_boxw / 2,
+                        0.5,
+                        sb_boxw / 2,
+                        sb_zoom_y,
+                        -0.5 + sb_boxh / 2,
+                        0.5,
+                        sb_boxh / 2);
 
   const gboolean expose_full =
         port->pipe->backbuf                                // do we have an image?
-     && port->pipe->output_imgid == dev->image_storage.id; // same image?
+     && port->pipe->output_imgid == dev->image_storage.id;  // same image?
 
-  const gboolean use_loading_screen =
-#ifdef _WIN32
-    TRUE;
-#else
-    dt_conf_get_bool("darkroom/ui/loading_screen");
-#endif
   if(expose_full)
   {
     // draw image
@@ -607,11 +750,27 @@ void expose(dt_view_t *self,
       cairo_surface_destroy(darktable.gui->surface);
       darktable.gui->surface = NULL;
     }
-    if(!use_loading_screen)
+    if(!dt_conf_get_bool("darkroom/ui/loading_screen"))
     {
-      // cache the rendered bitmap for use while loading the next image
+      // Cache the rendered content for display while loading the next image.
+#ifdef _WIN32
+      // On the Win32 GDK backend, holding a cairo_surface_reference() to
+      // cairo_get_target(cri) prevents GTK from properly invalidating the
+      // widget surface, causing gtk_widget_queue_draw() to silently fail
+      // (issue #20831). Copy to a standalone image surface instead.
+      cairo_surface_t *target = cairo_get_target(cri);
+      if(width > 0 && height > 0)
+      {
+        darktable.gui->surface = cairo_image_surface_create(CAIRO_FORMAT_ARGB32, width, height);
+        cairo_t *cr2 = cairo_create(darktable.gui->surface);
+        cairo_set_source_surface(cr2, target, 0, 0);
+        cairo_paint(cr2);
+        cairo_destroy(cr2);
+      }
+#else
       darktable.gui->surface = cairo_get_target(cri);
       cairo_surface_reference(darktable.gui->surface);
+#endif
     }
   }
   else if(dev->preview_pipe->output_imgid != dev->image_storage.id)
@@ -693,14 +852,14 @@ void expose(dt_view_t *self,
     else
     {
       fontsize = DT_PIXEL_APPLY_DPI(14);
-      if(use_loading_screen)
+      if(dt_conf_get_bool("darkroom/ui/loading_screen"))
         load_txt = g_strdup_printf(C_("darkroom", "loading `%s' ..."),
                                    dev->image_storage.filename);
       else
         load_txt = g_strdup(dev->image_storage.filename);
     }
 
-    if(use_loading_screen)
+    if(dt_conf_get_bool("darkroom/ui/loading_screen"))
     {
       dt_gui_gtk_set_source_rgb(cri, DT_GUI_COLOR_DARKROOM_BG);
       cairo_paint(cri);
@@ -740,6 +899,12 @@ void expose(dt_view_t *self,
         cairo_set_source_surface(cri, darktable.gui->surface, 0, 0);
         cairo_paint(cri);
         cairo_restore(cri);
+      }
+      else
+      {
+        // No cached surface (first entry from lighttable) — paint background
+        dt_gui_gtk_set_source_rgb(cri, DT_GUI_COLOR_DARKROOM_BG);
+        cairo_paint(cri);
       }
       dt_toast_log("%s", load_txt);
     }
@@ -782,11 +947,12 @@ void expose(dt_view_t *self,
                                 0.0f, DT_DEV_TRANSFORM_DIR_ALL_GEOMETRY, prev_pts, 1);
   const float pp_wd = dev->preview_pipe->processed_width;
   const float pp_ht = dev->preview_pipe->processed_height;
-  float zoom_x_vp = pp_wd > 0 ? prev_pts[0] / pp_wd - 0.5f : 0.f;
-  float zoom_y_vp = pp_ht > 0 ? prev_pts[1] / pp_ht - 0.5f : 0.f;
-  // apply same clamping as zoom_x/zoom_y (image fits nearly entirely in view)
-  if(boxw > 0.95f) zoom_x_vp = 0.f;
-  if(boxh > 0.95f) zoom_y_vp = 0.f;
+  // Preview-pipe equivalent of the (real) full-pipe viewport centre. Kept
+  // in lock-step with zoom_x/zoom_y (not zeroed near fit) so the sub-pixel
+  // correction below stays small and the overlay tracks the image at every
+  // zoom level, including when panned off-canvas below the fit zoom.
+  const float zoom_x_vp = pp_wd > 0 ? prev_pts[0] / pp_wd - 0.5f : 0.f;
+  const float zoom_y_vp = pp_ht > 0 ? prev_pts[1] / pp_ht - 0.5f : 0.f;
 
   // don't draw guides and color pickers on image margins
   cairo_rectangle(cri, tb, tb, width - 2.0 * tb, height - 2.0 * tb);
@@ -854,9 +1020,18 @@ void expose(dt_view_t *self,
     cairo_rectangle(cri, vp_x, vp_y, vp_w, vp_h);
     cairo_clip(cri);
     // Mask overlay points are in preview-pipe output space; shift the
-    // coordinate origin by the sub-pixel difference between full-pipe
-    // and preview-pipe viewport centres so overlays land on the image.
-    cairo_translate(cri, (zoom_x - zoom_x_vp) * wd, (zoom_y - zoom_y_vp) * ht);
+    // coordinate origin by the difference between full-pipe and
+    // preview-pipe viewport centres so overlays land on the image. This
+    // correction is normally sub-pixel, but when panning beyond the canvas
+    // (to reach off-canvas handles) the preview-pipe forward transform can
+    // extrapolate a non-linear geometric distortion far outside the image
+    // and blow up; cap its magnitude so it can't drag the overlay off the
+    // image content (which would otherwise persist until the next
+    // reprocess).
+    const float max_corr = 1.5f; // pixels
+    const float corr_x = CLAMP((zoom_x - zoom_x_vp) * wd, -max_corr, max_corr);
+    const float corr_y = CLAMP((zoom_y - zoom_y_vp) * ht, -max_corr, max_corr);
+    cairo_translate(cri, corr_x, corr_y);
     dt_masks_events_post_expose(dmod, cri, width, height, 0.0f, 0.0f, zoom_scale);
     cairo_restore(cri);
   }
@@ -953,6 +1128,10 @@ void expose(dt_view_t *self,
     pango_font_description_free(desc);
     g_object_unref(layout);
   }
+
+  // hint shown while an external file drag hovers the darkroom
+  if(_darkroom_dnd_active)
+    _darkroom_draw_dnd_hint(cri, width, height, _("drop XMP sidecar files here to apply edits"));
 }
 
 void reset(dt_view_t *self)
@@ -1620,7 +1799,7 @@ static void _darkroom_ui_apply_style_activate_callback(GtkMenuItem *menuitem,
                                                        const dt_stylemenu_data_t *menu_data)
 {
   GdkEvent *event = gtk_get_current_event();
-  if(event->type == GDK_KEY_PRESS)
+  if(dt_gdk_event_get_type(event) == GDK_KEY_PRESS)
     dt_styles_apply_to_dev(menu_data->name, darktable.develop->image_storage.id);
   gdk_event_free(event);
 }
@@ -1630,7 +1809,7 @@ static gboolean _darkroom_ui_apply_style_button_callback
    GdkEventButton *event,
    const dt_stylemenu_data_t *menu_data)
 {
-  if(event->button == GDK_BUTTON_PRIMARY)
+  if(dt_gdk_event_get_button(event) == GDK_BUTTON_PRIMARY)
     dt_styles_apply_to_dev(menu_data->name, darktable.develop->image_storage.id);
   else
     dt_shortcut_copy_lua(NULL, menu_data->name);
@@ -1673,8 +1852,8 @@ static void _second_window_quickbutton_clicked(GtkWidget *w,
     gtk_widget_hide(wnd);
 
     // Flush pending events to let macOS process the hide before destroy
-    while(gtk_events_pending())
-      gtk_main_iteration_do(FALSE);
+    while(g_main_context_pending(NULL))
+      g_main_context_iteration(NULL, FALSE);
 
     gtk_widget_destroy(wnd);
 
@@ -1746,7 +1925,7 @@ static void _color_assessment_border_white_ratio_callback(GtkWidget *slider, gpo
   dt_conf_set_float("darkroom/ui/color_assessment_border_white_ratio", dt_bauhaus_slider_get(slider));
   if (dev->full.color_assessment)
   {
-    dt_dev_reprocess_center(dev);
+    dt_dev_reprocess_center(dev, INT_MAX);
   }
   else
   {
@@ -1781,7 +1960,7 @@ static void _latescaling_quickbutton_clicked(GtkWidget *w,
     if(dev->second_wnd)
       dt_dev_reprocess_all(dev);
     else
-      dt_dev_reprocess_center(dev);
+      dt_dev_reprocess_center(dev, 0);
   }
 }
 
@@ -1808,7 +1987,7 @@ static void _overexposed_quickbutton_clicked(GtkWidget *w,
   dt_develop_t *d = (dt_develop_t *)user_data;
   d->overexposed.enabled = !d->overexposed.enabled;
   dt_conf_set_bool("darkroom/ui/overexposed/enabled", d->overexposed.enabled);
-  dt_dev_reprocess_center(d);
+  dt_dev_reprocess_center(d, INT_MAX);
 }
 
 static void _colorscheme_callback(GtkWidget *combo,
@@ -1819,7 +1998,7 @@ static void _colorscheme_callback(GtkWidget *combo,
   if(d->overexposed.enabled == FALSE)
     gtk_button_clicked(GTK_BUTTON(d->overexposed.button));
   else
-    dt_dev_reprocess_center(d);
+    dt_dev_reprocess_center(d, 0);
 }
 
 static void _lower_callback(GtkWidget *slider,
@@ -1830,7 +2009,7 @@ static void _lower_callback(GtkWidget *slider,
   if(d->overexposed.enabled == FALSE)
     gtk_button_clicked(GTK_BUTTON(d->overexposed.button));
   else
-    dt_dev_reprocess_center(d);
+    dt_dev_reprocess_center(d, 0);
 }
 
 static void _upper_callback(GtkWidget *slider,
@@ -1841,7 +2020,7 @@ static void _upper_callback(GtkWidget *slider,
   if(d->overexposed.enabled == FALSE)
     gtk_button_clicked(GTK_BUTTON(d->overexposed.button));
   else
-    dt_dev_reprocess_center(d);
+    dt_dev_reprocess_center(d, 0);
 }
 
 static void _mode_callback(GtkWidget *slider,
@@ -1852,7 +2031,7 @@ static void _mode_callback(GtkWidget *slider,
   if(d->overexposed.enabled == FALSE)
     gtk_button_clicked(GTK_BUTTON(d->overexposed.button));
   else
-    dt_dev_reprocess_center(d);
+    dt_dev_reprocess_center(d, 0);
 }
 
 /* rawoverexposed */
@@ -1862,7 +2041,7 @@ static void _rawoverexposed_quickbutton_clicked(GtkWidget *w,
   dt_develop_t *d = (dt_develop_t *)user_data;
   d->rawoverexposed.enabled = !d->rawoverexposed.enabled;
   dt_conf_set_bool("darkroom/ui/rawoverexposed/enabled", d->rawoverexposed.enabled);
-  dt_dev_reprocess_center(d);
+  dt_dev_reprocess_center(d, INT_MAX);
 }
 
 static void _rawoverexposed_mode_callback(GtkWidget *combo,
@@ -1873,7 +2052,7 @@ static void _rawoverexposed_mode_callback(GtkWidget *combo,
   if(d->rawoverexposed.enabled == FALSE)
     gtk_button_clicked(GTK_BUTTON(d->rawoverexposed.button));
   else
-    dt_dev_reprocess_center(d);
+    dt_dev_reprocess_center(d, 0);
 }
 
 static void _rawoverexposed_colorscheme_callback(GtkWidget *combo,
@@ -1884,7 +2063,7 @@ static void _rawoverexposed_colorscheme_callback(GtkWidget *combo,
   if(d->rawoverexposed.enabled == FALSE)
     gtk_button_clicked(GTK_BUTTON(d->rawoverexposed.button));
   else
-    dt_dev_reprocess_center(d);
+    dt_dev_reprocess_center(d, 0);
 }
 
 static void _rawoverexposed_threshold_callback(GtkWidget *slider,
@@ -1895,7 +2074,7 @@ static void _rawoverexposed_threshold_callback(GtkWidget *slider,
   if(d->rawoverexposed.enabled == FALSE)
     gtk_button_clicked(GTK_BUTTON(d->rawoverexposed.button));
   else
-    dt_dev_reprocess_center(d);
+    dt_dev_reprocess_center(d, 0);
 }
 
 /* softproof */
@@ -1909,8 +2088,8 @@ static void _softproof_quickbutton_clicked(GtkWidget *w,
     darktable.color_profiles->mode = DT_PROFILE_SOFTPROOF;
 
   _update_softproof_gamut_checking(d);
-
-  dt_dev_reprocess_center(d);
+  const dt_iop_module_t *cout = dt_iop_get_module("colorout");
+  dt_dev_reprocess_center(d, cout->iop_order);
 }
 
 /* gamut */
@@ -1924,8 +2103,8 @@ static void _gamut_quickbutton_clicked(GtkWidget *w,
     darktable.color_profiles->mode = DT_PROFILE_GAMUTCHECK;
 
   _update_softproof_gamut_checking(d);
-
-  dt_dev_reprocess_center(d);
+  const dt_iop_module_t *cout = dt_iop_get_module("colorout");
+  dt_dev_reprocess_center(d, cout->iop_order);
 }
 
 /* set the gui state for both softproof and gamut checking */
@@ -2586,8 +2765,8 @@ static gboolean _quickbutton_press_release(GtkWidget *button,
   int delay = 0;
   g_object_get(gtk_settings_get_default(), "gtk-long-press-time", &delay, NULL);
 
-  if((event->type == GDK_BUTTON_PRESS && event->button == GDK_BUTTON_SECONDARY) ||
-     (event->type == GDK_BUTTON_RELEASE && event->time - start_time > delay))
+  if((dt_gdk_event_get_type(event) == GDK_BUTTON_PRESS && dt_gdk_event_get_button(event) == GDK_BUTTON_SECONDARY) ||
+     (dt_gdk_event_get_type(event) == GDK_BUTTON_RELEASE && dt_gdk_event_get_time(event) - start_time > delay))
   {
     gtk_popover_set_relative_to(GTK_POPOVER(popover), button);
 
@@ -2598,7 +2777,7 @@ static gboolean _quickbutton_press_release(GtkWidget *button,
   }
   else
   {
-    start_time = event->time;
+    start_time = dt_gdk_event_get_time(event);
     return FALSE;
   }
 }
@@ -3436,6 +3615,199 @@ void gui_init(dt_view_t *self)
                      GDK_KEY_x, GDK_CONTROL_MASK);
 }
 
+/* drag&drop of XMP sidecar files onto the darkroom canvas */
+
+// custom dialog responses for the single-XMP dialog
+enum
+{
+  _DND_XMP_REPLACE = 1,
+  _DND_XMP_DUPLICATE = 2,
+};
+
+static gboolean _path_is_xmp(const gchar *path)
+{
+  const gchar *dot = strrchr(path, '.');
+  return dot && !g_ascii_strcasecmp(dot, ".xmp");
+}
+
+// switch the darkroom to a freshly created duplicate so the dropped
+// history becomes visible
+static void _darkroom_show_image(dt_develop_t *dev, const dt_imgid_t imgid)
+{
+  _dev_change_image(dev, imgid);
+  if(dt_conf_get_bool("filmstrip/ui/auto_scroll"))
+    dt_thumbtable_set_offset_image(dt_ui_thumbtable(darktable.gui->ui), imgid, TRUE);
+  dt_control_queue_redraw();
+}
+
+// build a question dialog parented to and centered on the main window, with
+// the given primary text. The caller adds the buttons and runs it.
+static GtkWidget *_darkroom_dnd_dialog_new(const char *title, const char *text)
+{
+  GtkWindow *win = GTK_WINDOW(dt_ui_main_window(darktable.gui->ui));
+  GtkWidget *dialog = gtk_message_dialog_new(
+    win, GTK_DIALOG_DESTROY_WITH_PARENT, GTK_MESSAGE_QUESTION, GTK_BUTTONS_NONE, "%s", text);
+  gtk_window_set_title(GTK_WINDOW(dialog), title);
+  gtk_window_set_position(GTK_WINDOW(dialog), GTK_WIN_POS_CENTER_ON_PARENT);
+#ifdef GDK_WINDOWING_QUARTZ
+  dt_osx_disallow_fullscreen(dialog);
+#endif
+  return dialog;
+}
+
+// create a duplicate of imgid and apply the sidecar to it, returning the new
+// imgid (or NO_IMGID on failure)
+static dt_imgid_t _darkroom_duplicate_with_xmp(const dt_imgid_t imgid, gchar *path)
+{
+  const dt_imgid_t newid = dt_image_duplicate(imgid);
+  if(!dt_is_valid_imgid(newid))
+    return NO_IMGID;
+  if(dt_history_load_and_apply(newid, path, TRUE))
+    return NO_IMGID; // sidecar could not be read
+
+  // label the duplicate with the sidecar name (without extension) so the
+  // versions are easy to tell apart
+  gchar *name = g_path_get_basename(path);
+  gchar *dot = strrchr(name, '.');
+  if(dot)
+    *dot = '\0';
+  dt_metadata_set(newid, "Xmp.darktable.version_name", name, FALSE);
+  dt_image_synch_xmp(newid);
+  g_free(name);
+
+  return newid;
+}
+
+// apply the dropped XMP sidecar(s) to the current darkroom image. With a
+// single file the user is asked whether to replace the current history or
+// create a duplicate; with several files one duplicate is created per file.
+static void _darkroom_apply_dropped_xmps(dt_develop_t *dev, GList *xmps)
+{
+  const dt_imgid_t imgid = dev->image_storage.id;
+  if(!dt_is_valid_imgid(imgid) || !xmps)
+    return;
+
+  const guint nb = g_list_length(xmps);
+
+  if(nb == 1)
+  {
+    gchar *path = xmps->data;
+    gchar *name = g_path_get_basename(path);
+
+    gchar *text = g_strdup_printf(_("apply the dropped sidecar '%s'?"), name);
+    GtkWidget *dialog = _darkroom_dnd_dialog_new(_("apply sidecar"), text);
+    g_free(text);
+    gtk_message_dialog_format_secondary_text(
+      GTK_MESSAGE_DIALOG(dialog),
+      _("replace the history of the current image, or create a duplicate"
+        " and apply the history to it?"));
+    gtk_dialog_add_button(GTK_DIALOG(dialog), _("_cancel"), GTK_RESPONSE_CANCEL);
+    gtk_dialog_add_button(GTK_DIALOG(dialog), _("create _duplicate"), _DND_XMP_DUPLICATE);
+    gtk_dialog_add_button(GTK_DIALOG(dialog), _("_replace history"), _DND_XMP_REPLACE);
+    gtk_dialog_set_default_response(GTK_DIALOG(dialog), _DND_XMP_REPLACE);
+    const gint res = gtk_dialog_run(GTK_DIALOG(dialog));
+    gtk_widget_destroy(dialog);
+
+    if(res == _DND_XMP_REPLACE)
+    {
+      // dt_history_load_and_apply reloads the darkroom history for the
+      // current image internally; non-zero means an error occurred
+      if(dt_history_load_and_apply(imgid, path, TRUE))
+        dt_control_log(_("error loading sidecar '%s'"), name);
+      else
+        dt_control_log(_("applied '%s' to the current image"), name);
+    }
+    else if(res == _DND_XMP_DUPLICATE)
+    {
+      const dt_imgid_t newid = _darkroom_duplicate_with_xmp(imgid, path);
+      if(dt_is_valid_imgid(newid))
+        _darkroom_show_image(dev, newid);
+      else
+        dt_control_log(_("error loading sidecar '%s'"), name);
+    }
+    g_free(name);
+  }
+  else
+  {
+    gchar *text = g_strdup_printf(ngettext("%d duplicate of the current image will be created,"
+                                           " one per dropped sidecar.",
+                                           "%d duplicates of the current image will be created,"
+                                           " one per dropped sidecar.",
+                                           nb),
+                                  nb);
+    GtkWidget *dialog = _darkroom_dnd_dialog_new(_("create duplicates"), text);
+    g_free(text);
+    gtk_dialog_add_button(GTK_DIALOG(dialog), _("_cancel"), GTK_RESPONSE_CANCEL);
+    gtk_dialog_add_button(GTK_DIALOG(dialog), _("_create"), GTK_RESPONSE_OK);
+    gtk_dialog_set_default_response(GTK_DIALOG(dialog), GTK_RESPONSE_OK);
+    const gint res = gtk_dialog_run(GTK_DIALOG(dialog));
+    gtk_widget_destroy(dialog);
+
+    if(res == GTK_RESPONSE_OK)
+    {
+      guint applied = 0;
+      dt_undo_start_group(darktable.undo, DT_UNDO_LT_HISTORY);
+      for(GList *l = xmps; l; l = g_list_next(l))
+        if(dt_is_valid_imgid(_darkroom_duplicate_with_xmp(imgid, l->data)))
+          applied++;
+      dt_undo_end_group(darktable.undo);
+
+      if(applied)
+        dt_control_log(ngettext("created %u duplicate from dropped sidecars",
+                                "created %u duplicates from dropped sidecars",
+                                applied),
+                       applied);
+      else
+        dt_control_log(_("error loading the dropped sidecars"));
+    }
+  }
+}
+
+static void _darkroom_dnd_xmp_received(GtkWidget *widget,
+                                       GdkDragContext *context,
+                                       const gint x,
+                                       const gint y,
+                                       GtkSelectionData *selection_data,
+                                       const guint target_type,
+                                       const guint time,
+                                       gpointer user_data)
+{
+  dt_develop_t *dev = (dt_develop_t *)user_data;
+  gboolean success = FALSE;
+
+  // the drop ends the drag: clear the hint overlay before the dialog runs
+  _darkroom_dnd_stop();
+
+  if(selection_data != NULL && target_type == DND_TARGET_URI &&
+     gtk_selection_data_get_length(selection_data) >= 0)
+  {
+    GList *xmps = NULL;
+    gchar **uris = gtk_selection_data_get_uris(selection_data);
+    if(uris)
+    {
+      for(int i = 0; uris[i]; i++)
+      {
+        gchar *path = g_filename_from_uri(uris[i], NULL, NULL);
+        if(path && _path_is_xmp(path) && g_file_test(path, G_FILE_TEST_IS_REGULAR))
+          xmps = g_list_prepend(xmps, path);
+        else
+          g_free(path);
+      }
+      g_strfreev(uris);
+    }
+    xmps = g_list_reverse(xmps);
+
+    if(xmps)
+    {
+      _darkroom_apply_dropped_xmps(dev, xmps);
+      success = TRUE;
+      g_list_free_full(xmps, g_free);
+    }
+  }
+
+  gtk_drag_finish(context, success, FALSE, time);
+}
+
 void enter(dt_view_t *self)
 {
   // prevent accels_window to refresh
@@ -3586,6 +3958,32 @@ void enter(dt_view_t *self)
 
   dt_image_check_camera_missing_sample(&dev->image_storage);
 
+  /* accept XMP sidecar files dropped onto the center view; we draw our own
+     drag hint so don't request GTK's default highlight */
+  GtkWidget *center = dt_ui_center(darktable.gui->ui);
+  gtk_drag_dest_set(center,
+                    GTK_DEST_DEFAULT_MOTION | GTK_DEST_DEFAULT_DROP,
+                    target_list_external,
+                    n_targets_external,
+                    GDK_ACTION_COPY);
+  g_signal_connect(
+    G_OBJECT(center), "drag-data-received", G_CALLBACK(_darkroom_dnd_xmp_received), dev);
+
+  /* show drop hints while a file drag hovers the center view or the filmstrip.
+     the filmstrip thumbtable is already a drop target, so we just listen to the
+     drag-motion/drag-leave of both widgets and paint a hint accordingly */
+  _darkroom_dnd_active = FALSE;
+  g_signal_connect(G_OBJECT(center), "drag-motion", G_CALLBACK(_darkroom_dnd_motion), NULL);
+  g_signal_connect(G_OBJECT(center), "drag-leave", G_CALLBACK(_darkroom_dnd_leave), NULL);
+  dt_thumbtable_t *tt = dt_ui_thumbtable(darktable.gui->ui);
+  if(tt)
+  {
+    g_signal_connect(G_OBJECT(tt->widget), "drag-motion", G_CALLBACK(_darkroom_dnd_motion), NULL);
+    g_signal_connect(G_OBJECT(tt->widget), "drag-leave", G_CALLBACK(_darkroom_dnd_leave), NULL);
+    g_signal_connect_after(
+      G_OBJECT(tt->widget), "draw", G_CALLBACK(_darkroom_filmstrip_draw_hint), NULL);
+  }
+
 #ifdef USE_LUA
 
   _fire_darkroom_image_loaded_event(TRUE, dev->image_storage.id);
@@ -3600,7 +3998,35 @@ void leave(dt_view_t *self)
   if(darktable.lib->proxy.colorpicker.picker_proxy)
     dt_iop_color_picker_reset(darktable.lib->proxy.colorpicker.picker_proxy->module, FALSE);
 
+  // Clear cached surface so the loading screen shows on next darkroom entry
+  if(darktable.gui->surface)
+  {
+    cairo_surface_destroy(darktable.gui->surface);
+    darktable.gui->surface = NULL;
+  }
+
   DT_CONTROL_SIGNAL_DISCONNECT_ALL(self, "darkroom");
+
+  // stop accepting XMP sidecar drops and tear down the drop-hint machinery on
+  // the (shared) center view and filmstrip
+  _darkroom_dnd_stop();
+  GtkWidget *center = dt_ui_center(darktable.gui->ui);
+  g_signal_handlers_disconnect_by_func(
+    G_OBJECT(center), G_CALLBACK(_darkroom_dnd_xmp_received), self->data);
+  g_signal_handlers_disconnect_by_func(G_OBJECT(center), G_CALLBACK(_darkroom_dnd_motion), NULL);
+  g_signal_handlers_disconnect_by_func(G_OBJECT(center), G_CALLBACK(_darkroom_dnd_leave), NULL);
+  gtk_drag_dest_unset(center);
+
+  dt_thumbtable_t *tt = dt_ui_thumbtable(darktable.gui->ui);
+  if(tt)
+  {
+    g_signal_handlers_disconnect_by_func(
+      G_OBJECT(tt->widget), G_CALLBACK(_darkroom_dnd_motion), NULL);
+    g_signal_handlers_disconnect_by_func(
+      G_OBJECT(tt->widget), G_CALLBACK(_darkroom_dnd_leave), NULL);
+    g_signal_handlers_disconnect_by_func(
+      G_OBJECT(tt->widget), G_CALLBACK(_darkroom_filmstrip_draw_hint), NULL);
+  }
 
   // store groups for next time:
   dt_conf_set_int("plugins/darkroom/groups", dt_dev_modulegroups_get(darktable.develop));
@@ -4574,9 +5000,9 @@ static gboolean _second_window_scrolled_callback(GtkWidget *widget,
     dt_dev_viewport_t *port = pinned_dev ? &pinned_dev->preview2 : &dev->preview2;
 
     const gboolean constrained =
-      dev->constrain_zoom && !dt_modifier_is(event->state, GDK_CONTROL_MASK);
+      dev->constrain_zoom && !dt_modifier_is(dt_gdk_event_get_state(event), GDK_CONTROL_MASK);
     dt_dev_zoom_move(port, DT_ZOOM_SCROLL, 0.0f, delta_y < 0,
-                     event->x, event->y, constrained);
+                     dt_gdk_event_get_x(event), dt_gdk_event_get_y(event), constrained);
   }
 
   return TRUE;
@@ -4595,24 +5021,24 @@ static gboolean _second_window_button_pressed_callback(GtkWidget *w,
   dt_dev_viewport_t *port = pinned_dev ? &pinned_dev->preview2 : &dev->preview2;
 
   // Handle double-click to reset zoom and center
-  if(event->type == GDK_2BUTTON_PRESS && event->button == GDK_BUTTON_PRIMARY)
+  if(dt_gdk_event_get_type(event) == GDK_2BUTTON_PRESS && dt_gdk_event_get_button(event) == GDK_BUTTON_PRIMARY)
   {
     dt_dev_zoom_move(port, DT_ZOOM_FIT, 0.0f, 0,
-                     event->x, event->y, TRUE);
+                     dt_gdk_event_get_x(event), dt_gdk_event_get_y(event), TRUE);
     return TRUE;
   }
-  if(event->button == GDK_BUTTON_PRIMARY)
+  if(dt_gdk_event_get_button(event) == GDK_BUTTON_PRIMARY)
   {
     // store coordinates in logical pixels (as delivered by event)
-    darktable.control->button_x = event->x;
-    darktable.control->button_y = event->y;
+    darktable.control->button_x = dt_gdk_event_get_x(event);
+    darktable.control->button_y = dt_gdk_event_get_y(event);
     _dt_second_window_change_cursor(dev, "grabbing");
     return TRUE;
   }
-  if(event->button == GDK_BUTTON_MIDDLE)
+  if(dt_gdk_event_get_button(event) == GDK_BUTTON_MIDDLE)
   {
     dt_dev_zoom_move(port, DT_ZOOM_1, 0.0f, -2,
-                     event->x, event->y, !dt_modifier_is(event->state, GDK_CONTROL_MASK));
+                     dt_gdk_event_get_x(event), dt_gdk_event_get_y(event), !dt_modifier_is(dt_gdk_event_get_state(event), GDK_CONTROL_MASK));
     return TRUE;
   }
   return FALSE;
@@ -4622,7 +5048,7 @@ static gboolean _second_window_button_released_callback(GtkWidget *w,
                                                         GdkEventButton *event,
                                                         dt_develop_t *dev)
 {
-  if(event->button == GDK_BUTTON_PRIMARY) _dt_second_window_change_cursor(dev, "default");
+  if(dt_gdk_event_get_button(event) == GDK_BUTTON_PRIMARY) _dt_second_window_change_cursor(dev, "default");
 
   gtk_widget_queue_draw(w);
   return TRUE;
@@ -4634,7 +5060,7 @@ static gboolean _second_window_mouse_moved_callback(GtkWidget *w,
 {
   if(dev->gui_leaving) return FALSE;
 
-  if(event->state & GDK_BUTTON1_MASK)
+  if(dt_gdk_event_get_state(event) & GDK_BUTTON1_MASK)
   {
     dt_control_t *ctl = darktable.control;
 
@@ -4645,9 +5071,9 @@ static gboolean _second_window_mouse_moved_callback(GtkWidget *w,
     dt_dev_viewport_t *port = pinned_dev ? &pinned_dev->preview2 : &dev->preview2;
 
     dt_dev_zoom_move(port, DT_ZOOM_MOVE, -1.f, 0,
-                     event->x - ctl->button_x, event->y - ctl->button_y, TRUE);
-    ctl->button_x = event->x;
-    ctl->button_y = event->y;
+                     dt_gdk_event_get_x(event) - ctl->button_x, dt_gdk_event_get_y(event) - ctl->button_y, TRUE);
+    ctl->button_x = dt_gdk_event_get_x(event);
+    ctl->button_y = dt_gdk_event_get_y(event);
     return TRUE;
   }
   return FALSE;
@@ -4680,7 +5106,7 @@ static gboolean _second_window_configure_callback(GtkWidget *da,
     // pipe needs to be reconstructed
     dev->preview2.pipe->status = DT_DEV_PIXELPIPE_DIRTY;
     dev->preview2.pipe->changed |= DT_DEV_PIPE_REMOVE;
-    dev->preview2.pipe->cache_obsolete = TRUE;
+    dev->preview2.pipe->cache_obsolete_order = 0;
 
     // If we have a pinned image, update its viewport dimensions too
     dt_develop_t *pinned_dev = dev->preview2_pinned ? dev->preview2_pinned_dev : NULL;
@@ -4693,7 +5119,7 @@ static gboolean _second_window_configure_callback(GtkWidget *da,
       pinned_port->orig_height = event->height;
       pinned_port->pipe->status = DT_DEV_PIXELPIPE_DIRTY;
       pinned_port->pipe->changed |= DT_DEV_PIPE_REMOVE;
-      pinned_port->pipe->cache_obsolete = TRUE;
+      pinned_port->pipe->cache_obsolete_order = 0;
     }
   }
 
@@ -4991,7 +5417,7 @@ static void _darkroom_display_second_window(dt_develop_t *dev)
     gtk_widget_set_size_request(dev->preview2.widget, DT_PIXEL_APPLY_DPI_2ND_WND(dev, 50), DT_PIXEL_APPLY_DPI_2ND_WND(dev, 200));
     gtk_widget_set_hexpand(dev->preview2.widget, TRUE);
     gtk_widget_set_vexpand(dev->preview2.widget, TRUE);
-    gtk_widget_set_app_paintable(dev->preview2.widget, TRUE);
+    dt_gui_add_class(dev->preview2.widget, "dt_transparent_background");
 
     gtk_widget_set_events(dev->preview2.widget,
                           GDK_POINTER_MOTION_MASK

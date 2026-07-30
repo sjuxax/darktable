@@ -1,6 +1,6 @@
 /*
     This file is part of darktable,
-    Copyright (C) 2022-2024 darktable developers.
+    Copyright (C) 2022-2026 darktable developers.
 
     darktable is free software: you can redistribute it and/or modify
     it under the terms of the GNU General Public License as published by
@@ -15,6 +15,7 @@
     You should have received a copy of the GNU General Public License
     along with darktable.  If not, see <http://www.gnu.org/licenses/>.
 */
+#include "common/gdk_event_utils.h"
 #include "range.h"
 #include "bauhaus/bauhaus.h"
 #include "control/control.h"
@@ -143,11 +144,11 @@ static void _dt_pref_changed(gpointer instance, gpointer user_data)
 }
 
 // cleanup everything when the widget is destroyed
-static void _range_select_destroy(GtkWidget *widget)
+static void _range_select_dispose(GObject *object)
 {
-  g_return_if_fail(DTGTK_IS_RANGE_SELECT(widget));
+  g_return_if_fail(DTGTK_IS_RANGE_SELECT(object));
 
-  GtkDarktableRangeSelect *range = DTGTK_RANGE_SELECT(widget);
+  GtkDarktableRangeSelect *range = DTGTK_RANGE_SELECT(object);
 
   DT_CONTROL_SIGNAL_DISCONNECT(_dt_pref_changed, range);
 
@@ -171,13 +172,13 @@ static void _range_select_destroy(GtkWidget *widget)
     g_free(range->cur_help);
   range->cur_help = NULL;
 
-  GTK_WIDGET_CLASS(dtgtk_range_select_parent_class)->destroy(widget);
+  G_OBJECT_CLASS(dtgtk_range_select_parent_class)->dispose(object);
 }
 
 static void dtgtk_range_select_class_init(GtkDarktableRangeSelectClass *klass)
 {
-  GtkWidgetClass *widget_class = (GtkWidgetClass *)klass;
-  widget_class->destroy = _range_select_destroy;
+  GObjectClass *object_class = (GObjectClass *)klass;
+  object_class->dispose = _range_select_dispose;
 
   _signals[VALUE_CHANGED] = g_signal_new("value-changed", G_TYPE_FROM_CLASS(klass), G_SIGNAL_RUN_LAST, 0, NULL,
                                          NULL, g_cclosure_marshal_VOID__VOID, G_TYPE_NONE, 0);
@@ -1511,7 +1512,7 @@ void dtgtk_range_select_redraw(GtkDarktableRangeSelect *range)
 static gboolean _event_band_motion(GtkWidget *widget, GdkEventMotion *event, gpointer user_data)
 {
   GtkDarktableRangeSelect *range = (GtkDarktableRangeSelect *)user_data;
-  range->current_x_px = event->x - range->alloc_padding.x;
+  range->current_x_px = dt_gdk_event_get_x(event) - range->alloc_padding.x;
 
   // if we are outside the graph, don't go further
   const gboolean inside = (range->current_x_px >= 0 && range->current_x_px <= range->alloc_padding.width);
@@ -1526,7 +1527,7 @@ static gboolean _event_band_motion(GtkWidget *widget, GdkEventMotion *event, gpo
   // point the popup to the current position
   gint wx, wy;
   gtk_widget_translate_coordinates(range->band, gtk_widget_get_toplevel(range->band), 0, 0, &wx, &wy);
-  GdkRectangle rect = { event->x, 0, 1, gtk_widget_get_allocated_height(range->band) };
+  GdkRectangle rect = { dt_gdk_event_get_x(event), 0, 1, gtk_widget_get_allocated_height(range->band) };
   gtk_popover_set_pointing_to(GTK_POPOVER(range->cur_window), &rect);
 
   const double smin_r = (range->bounds & DT_RANGE_BOUND_MIN) ? range->min_r : range->select_min_r;

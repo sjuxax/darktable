@@ -52,6 +52,14 @@
 
 #define DT_DEV_AVERAGE_DELAY_COUNT 5
 
+// Margins (as a fraction of the image size) by which the editable "canvas" may
+// extend beyond the image while working on a mask, so off-image content can be
+// panned into view. MASK_HANDLE_MARGIN keeps an off-image node clear of the
+// viewport border; MASK_CREATION_MARGIN gives room to drop new nodes outside
+// the picture while drawing.
+#define MASK_HANDLE_MARGIN 0.03f
+#define MASK_CREATION_MARGIN 0.15f
+
 // Forward declaration
 static inline void _dt_dev_load_raw(dt_develop_t *dev, const dt_imgid_t imgid);
 
@@ -1465,17 +1473,9 @@ void dt_dev_add_masks_history_item_ext(dt_develop_t *dev,
   gboolean enable = _enable;
 
   // no module means that is called from the mask manager, so find the iop
-  if(module == NULL)
+  if (module == NULL)
   {
-    for(GList *modules = dev->iop; modules; modules = g_list_next(modules))
-    {
-      dt_iop_module_t *mod = modules->data;
-      if(dt_iop_module_is(mod, "mask_manager"))
-      {
-        module = mod;
-        break;
-      }
-    }
+    module = dt_iop_get_module("mask_manager");
     enable = FALSE;
   }
   if(module)
@@ -2794,13 +2794,13 @@ void dt_dev_reprocess_all(dt_develop_t *dev)
   }
 }
 
-void dt_dev_reprocess_center(dt_develop_t *dev)
+void dt_dev_reprocess_center(dt_develop_t *dev, const int32_t iop_order)
 {
   DT_GUARD_GUI_UPDATE();
   if(dev && dev->gui_attached)
   {
     dev->full.pipe->changed |= DT_DEV_PIPE_SYNCH;
-    dev->full.pipe->cache_obsolete = TRUE;
+    dev->full.pipe->cache_obsolete_order = iop_order;
 
     // invalidate buffers and force redraw of darkroom
     dt_dev_invalidate_all(dev);
@@ -2810,13 +2810,13 @@ void dt_dev_reprocess_center(dt_develop_t *dev)
   }
 }
 
-void dt_dev_reprocess_preview(dt_develop_t *dev)
+void dt_dev_reprocess_preview(dt_develop_t *dev, const int32_t iop_order)
 {
   if(DT_IN_GUI_UPDATE() || !dev || !dev->gui_attached)
     return;
 
   dev->preview_pipe->changed |= DT_DEV_PIPE_SYNCH;
-  dev->preview_pipe->cache_obsolete = TRUE;
+  dev->preview_pipe->cache_obsolete_order = iop_order;
 
   dt_dev_invalidate_preview(dev);
   dt_control_queue_redraw_center();
@@ -3066,6 +3066,124 @@ static gboolean _dev_distort_transform_locked(dt_develop_t *dev,
   return TRUE;
 }
 
+// Compute the bounding box of the mask overlay currently being edited
+// (all displayed points, borders and clone sources), expressed in
+// normalised image coordinates where the image spans [-0.5, 0.5]. The
+// overlay points live in preview-pipe output space, so we normalise by
+// the preview-pipe processed size. Returns FALSE when no overlay is
+// available, leaving the outputs untouched. Used to let the user pan
+// beyond the canvas to reach mask handles that lie outside it.
+static gboolean
+_dev_mask_overlay_bounds(const dt_develop_t *dev, float *x0, float *y0, float *x1, float *y1)
+{
+  if(!dev->form_visible || !dev->form_gui || !dev->form_gui->points)
+    return FALSE;
+
+  float wd, ht;
+  if(!dt_dev_get_preview_size(dev, &wd, &ht))
+    return FALSE;
+
+  float minx = FLT_MAX, miny = FLT_MAX, maxx = -FLT_MAX, maxy = -FLT_MAX;
+
+  for(GList *l = dev->form_gui->points; l; l = g_list_next(l))
+  {
+    const dt_masks_form_gui_points_t *gpt = l->data;
+    if(!gpt)
+      continue;
+
+    // points[], border[] and source[] are interleaved (x, y) pairs
+    const float *const arrays[3] = { gpt->points, gpt->border, gpt->source };
+    const int counts[3] = { gpt->points_count, gpt->border_count, gpt->source_count };
+    for(int a = 0; a < 3; a++)
+    {
+      const float *p = arrays[a];
+      if(!p)
+        continue;
+      for(int i = 0; i < counts[a]; i++)
+      {
+        const float px = p[i * 2];
+        const float py = p[i * 2 + 1];
+        minx = fminf(minx, px);
+        maxx = fmaxf(maxx, px);
+        miny = fminf(miny, py);
+        maxy = fmaxf(maxy, py);
+      }
+    }
+  }
+
+  if(minx > maxx) // no points contributed to the bounding box
+    return FALSE;
+
+  *x0 = minx / wd - 0.5f;
+  *x1 = maxx / wd - 0.5f;
+  *y0 = miny / ht - 0.5f;
+  *y1 = maxy / ht - 0.5f;
+  return TRUE;
+}
+
+// Clamp the viewport centre (zoom_x, zoom_y, in [-0.5, 0.5] image space) to the
+// editable "canvas". Normally the canvas is just the image, so the viewport
+// can't pan past the picture. While working on a mask the canvas is enlarged so
+// off-image content can be panned into view (it is otherwise never on screen
+// once the image fills the viewport, e.g. at fit):
+//   - while drawing, by MASK_CREATION_MARGIN all round, giving room to drop new
+//     nodes outside the picture;
+//   - by any overlay point already outside the image (e.g. a node dragged past
+//     the edge), plus MASK_HANDLE_MARGIN so it isn't flush to the border.
+// boxw/boxh are the viewport extents in image units along each axis.
+static void _clamp_zoom_to_mask(
+  const dt_develop_t *dev, const float boxw, const float boxh, float *zoom_x, float *zoom_y)
+{
+  const gboolean creating = dev->form_gui && dev->form_gui->creation;
+
+  float lox = -0.5f, hix = 0.5f, loy = -0.5f, hiy = 0.5f;
+  if(creating)
+  {
+    lox -= MASK_CREATION_MARGIN;
+    hix += MASK_CREATION_MARGIN;
+    loy -= MASK_CREATION_MARGIN;
+    hiy += MASK_CREATION_MARGIN;
+  }
+  float mx0, my0, mx1, my1;
+  if(_dev_mask_overlay_bounds(dev, &mx0, &my0, &mx1, &my1))
+  {
+    if(mx0 < -0.5f)
+      lox = fminf(lox, mx0 - MASK_HANDLE_MARGIN);
+    if(mx1 > 0.5f)
+      hix = fmaxf(hix, mx1 + MASK_HANDLE_MARGIN);
+    if(my0 < -0.5f)
+      loy = fminf(loy, my0 - MASK_HANDLE_MARGIN);
+    if(my1 > 0.5f)
+      hiy = fmaxf(hiy, my1 + MASK_HANDLE_MARGIN);
+  }
+
+  // Clamp the viewport CENTRE to the editable region. On each side the centre
+  // may travel between two positions:
+  //
+  //  - its "home": image centred when the image fits the viewport (homew == 0),
+  //    or the image edge held at the viewport edge when the image is larger than
+  //    the viewport (homew == 0.5 - halfw, the plain darktable clamp);
+  //  - the node position (lox/hix, MASK_HANDLE_MARGIN already included), if that
+  //    side was extended for off-image mask content, so the node can be reached.
+  //
+  // The home position is NOT forced -- the incoming (cursor-anchored or panned)
+  // centre is merely clamped into [home..node] -- so a plain zoom that leaves
+  // the centre near home keeps the image centred, while a deliberate pan can
+  // still travel out to a node. Crucially the node bound does not depend on
+  // zoom, so the framing neither drifts nor swims as you zoom in/out while
+  // reaching an off-image node (an earlier "... - halfw" bound, or centring the
+  // whole canvas, dragged the picture across the screen on every zoom step).
+  const float halfw = 0.5f * boxw, halfh = 0.5f * boxh;
+  const float homew = boxw >= 1.0f ? 0.0f : 0.5f - halfw;
+  const float homeh = boxh >= 1.0f ? 0.0f : 0.5f - halfh;
+  const float cminx = (lox < -0.5f) ? lox : -homew;
+  const float cmaxx = (hix > 0.5f) ? hix : homew;
+  const float cminy = (loy < -0.5f) ? loy : -homeh;
+  const float cmaxy = (hiy > 0.5f) ? hiy : homeh;
+  *zoom_x = CLAMP(*zoom_x, cminx, cmaxx);
+  *zoom_y = CLAMP(*zoom_y, cminy, cmaxy);
+}
+
 void dt_dev_zoom_move(dt_dev_viewport_t *port,
                       dt_dev_zoom_t zoom,
                       float scale,
@@ -3231,8 +3349,9 @@ void dt_dev_zoom_move(dt_dev_viewport_t *port,
       zoom_y += mouse_off_y / cur_scale - mouse_off_y / new_scale;
     }
 
-    zoom_x = boxw > 1.0f ? 0.0f : CLAMP(zoom_x, boxw / 2 - .5, .5 - boxw / 2);
-    zoom_y = boxh > 1.0f ? 0.0f : CLAMP(zoom_y, boxh / 2 - .5, .5 - boxh / 2);
+    // While editing a mask, allow panning beyond the canvas to reach
+    // handles that lie outside the image (see helper for the details).
+    _clamp_zoom_to_mask(dev, boxw, boxh, &zoom_x, &zoom_y);
   }
 
   pts[0] = (zoom_x + 0.5f) * procw;
@@ -3526,7 +3645,7 @@ dt_iop_module_t *dt_dev_module_duplicate_ext(dt_develop_t *dev,
   dt_iop_module_t *module = calloc(1, sizeof(dt_iop_module_t));
   if(dt_iop_load_module(module, base->so, base->dev))
   {
-    free(module);
+    // failed module already freed while failing to load
     return NULL;
   }
   module->instance = base->instance;
@@ -3931,7 +4050,8 @@ void dt_dev_image(const dt_imgid_t imgid,
                   const int snapshot_id,
                   GList *module_filter_out,
                   const int devid,
-                  const gboolean finalscale)
+                  const gboolean finalscale,
+                  const gboolean want_float)
 {
   dt_develop_t dev;
   dt_dev_init(&dev, TRUE);
@@ -3939,6 +4059,11 @@ void dt_dev_image(const dt_imgid_t imgid,
   dt_dev_pixelpipe_t *pipe = dev.full.pipe;
 
   pipe->type |= DT_DEV_PIXELPIPE_IMAGE | (finalscale ? DT_DEV_PIXELPIPE_IMAGE_FINAL : DT_DEV_PIXELPIPE_NONE);
+  // want_float: keep gamma as the terminal module (so backbuf dimensions stay
+  // consistent) but have it pass the linear-float working RGB straight through
+  // instead of packing it to 8-bit. See gamma.c process().
+  if(want_float)
+    pipe->type |= DT_DEV_PIXELPIPE_IMAGE_FLOAT;
   // load image and set history_end
 
   dev.snapshot_id = snapshot_id;
@@ -3969,10 +4094,16 @@ void dt_dev_image(const dt_imgid_t imgid,
 
   // record resulting image and dimensions
 
-  const uint32_t bufsize =
-    sizeof(uint32_t) * pipe->backbuf_width * pipe->backbuf_height;
+  // Destination size the caller expects: 16 B/px for float, else 8-bit ARGB.
+  // The pipe's terminate step (dt_dev_pixelpipe_process) sizes pipe->backbuf to
+  // match: 4 floats/px when want_float (gamma passed the linear float through),
+  // 8-bit ARGB otherwise. So a straight copy of bufsize is exact.
+  const size_t bufsize = (want_float ? 4 * sizeof(float) : sizeof(uint32_t)) * pipe->backbuf_width *
+                         pipe->backbuf_height;
   *buf = dt_alloc_aligned(bufsize);
-  memcpy(*buf, pipe->backbuf, bufsize);
+  memset(*buf, 0, bufsize);
+  if(pipe->backbuf)
+    memcpy(*buf, pipe->backbuf, MIN(bufsize, pipe->backbuf_size));
 
   if(buf_width) *buf_width = pipe->backbuf_width;
   if(buf_height) *buf_height = pipe->backbuf_height;

@@ -15,6 +15,7 @@
     You should have received a copy of the GNU General Public License
     along with darktable.  If not, see <http://www.gnu.org/licenses/>.
 */
+#include "common/gdk_event_utils.h"
 
 #include "gui/preferences_ai.h"
 #include "bauhaus/bauhaus.h"
@@ -147,9 +148,12 @@ static gint _model_sort_func(GtkTreeModel *model,
       cmp = g_strcmp0(name_a, name_b);
   }
 
-  g_free(task_a); g_free(task_b);
-  g_free(default_a); g_free(default_b);
-  g_free(name_a); g_free(name_b);
+  g_free(task_a);
+  g_free(task_b);
+  g_free(default_a);
+  g_free(default_b);
+  g_free(name_a);
+  g_free(name_b);
   return cmp;
 }
 
@@ -609,7 +613,7 @@ static void _on_provider_changed(GtkWidget *widget, gpointer user_data)
 static gboolean
 _reset_enable_click(GtkWidget *label, GdkEventButton *event, GtkWidget *widget)
 {
-  if(event->type == GDK_2BUTTON_PRESS)
+  if(dt_gdk_event_get_type(event) == GDK_2BUTTON_PRESS)
   {
     const gboolean def = dt_confgen_get_bool("plugins/ai/enabled", DT_DEFAULT);
     gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(widget), def);
@@ -622,7 +626,7 @@ _reset_enable_click(GtkWidget *label, GdkEventButton *event, GtkWidget *widget)
 static gboolean
 _reset_provider_click(GtkWidget *label, GdkEventButton *event, gpointer user_data)
 {
-  if(event->type == GDK_2BUTTON_PRESS)
+  if(dt_gdk_event_get_type(event) == GDK_2BUTTON_PRESS)
   {
     dt_prefs_ai_data_t *data = (dt_prefs_ai_data_t *)user_data;
     const char *def = dt_confgen_get(DT_AI_CONF_PROVIDER, DT_DEFAULT);
@@ -730,7 +734,7 @@ static void _on_select_all_header_clicked(GtkWidget *button, gpointer user_data)
   // only toggle if the click wasn't already handled by the checkbox itself.
   // block the toggled signal to prevent double-fire, then toggle manually
   g_signal_handlers_block_by_func(data->select_all_toggle, _on_select_all_toggled, data);
-  gboolean active
+  const gboolean active
     = gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(data->select_all_toggle));
   gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(data->select_all_toggle), !active);
   g_signal_handlers_unblock_by_func(
@@ -787,8 +791,8 @@ static gboolean _update_progress_idle(gpointer user_data)
   dt_download_dialog_t *dl = (dt_download_dialog_t *)user_data;
 
   g_mutex_lock(&dl->mutex);
-  double progress = dl->progress;
-  gboolean finished = dl->finished;
+  const double progress = dl->progress;
+  const gboolean finished = dl->finished;
   g_mutex_unlock(&dl->mutex);
 
   if(dl->dialog && GTK_IS_WIDGET(dl->dialog))
@@ -915,7 +919,7 @@ _download_model_with_dialog(dt_prefs_ai_data_t *data, const char *model_id)
   gtk_widget_destroy(dialog);
   dl->dialog = NULL;
 
-  gboolean success = (dl->error == NULL);
+  const gboolean success = (dl->error == NULL);
 
   // notify modules that models have changed
   if(success)
@@ -954,9 +958,9 @@ static void _on_download_selected(GtkButton *button, gpointer user_data)
     dt_ai_model_t *model = dt_ai_models_get_by_id(id);
     if(model)
     {
-      gboolean need_download = (model->status == DT_AI_MODEL_NOT_DOWNLOADED
-                                || model->status == DT_AI_MODEL_UPDATE_AVAILABLE
-                                || model->status == DT_AI_MODEL_UPDATE_REQUIRED);
+      const gboolean need_download = (model->status == DT_AI_MODEL_NOT_DOWNLOADED
+                                     || model->status == DT_AI_MODEL_UPDATE_AVAILABLE
+                                     || model->status == DT_AI_MODEL_UPDATE_REQUIRED);
       dt_ai_model_free(model);
       if(need_download && !_download_model_with_dialog(data, id))
         break; // stop on error or cancel
@@ -977,11 +981,11 @@ static void _on_download_default(GtkButton *button, gpointer user_data)
     dt_ai_model_t *model = dt_ai_models_get_by_index(i);
     if(!model)
       continue;
-    gboolean need_download
-      = (model->is_default
-         && (model->status == DT_AI_MODEL_NOT_DOWNLOADED
-             || model->status == DT_AI_MODEL_UPDATE_AVAILABLE
-             || model->status == DT_AI_MODEL_UPDATE_REQUIRED));
+    const gboolean need_download =
+            (model->is_default
+             && (model->status == DT_AI_MODEL_NOT_DOWNLOADED
+                 || model->status == DT_AI_MODEL_UPDATE_AVAILABLE
+                 || model->status == DT_AI_MODEL_UPDATE_REQUIRED));
     char *id = need_download ? g_strdup(model->id) : NULL;
     dt_ai_model_free(model);
     if(need_download)
@@ -1264,15 +1268,15 @@ static gboolean _on_tree_motion(GtkWidget *widget,
   GdkWindow *bin = gtk_tree_view_get_bin_window(tv);
   if(!bin) return FALSE;
   gint bx, by;
-  if(event->window == bin)
+  if(dt_gdk_event_get_window(event) == bin)
   {
-    bx = (gint)event->x;
-    by = (gint)event->y;
+    bx = (gint)dt_gdk_event_get_x(event);
+    by = (gint)dt_gdk_event_get_y(event);
   }
   else
   {
     gtk_tree_view_convert_widget_to_bin_window_coords(
-      tv, (gint)event->x, (gint)event->y, &bx, &by);
+      tv, (gint)dt_gdk_event_get_x(event), (gint)dt_gdk_event_get_y(event), &bx, &by);
   }
   if(_info_active_at_bin(user_data, tv, bx, by))
   {
@@ -1292,8 +1296,8 @@ static gboolean _on_info_button_press(GtkWidget *widget,
                                       GdkEventButton *event,
                                       gpointer user_data)
 {
-  if(event->type != GDK_BUTTON_PRESS
-     || event->button != 1)
+  if(dt_gdk_event_get_type(event) != GDK_BUTTON_PRESS
+     || dt_gdk_event_get_button(event) != 1)
     return FALSE;
 
   dt_prefs_ai_data_t *data = (dt_prefs_ai_data_t *)user_data;
@@ -1301,7 +1305,7 @@ static gboolean _on_info_button_press(GtkWidget *widget,
   GtkTreePath *path = NULL;
   GtkTreeViewColumn *column = NULL;
 
-  if(!gtk_tree_view_get_path_at_pos(tv, (gint)event->x, (gint)event->y,
+  if(!gtk_tree_view_get_path_at_pos(tv, (gint)dt_gdk_event_get_x(event), (gint)dt_gdk_event_get_y(event),
                                     &path, &column, NULL, NULL))
     return FALSE;
 
@@ -1376,7 +1380,7 @@ static void _on_detect_system_ort(GtkButton *button, gpointer user_data)
   }
   else if(count == 1)
   {
-    dt_ai_ort_found_t *f = found->data;
+    const dt_ai_ort_found_t *f = found->data;
     gtk_entry_set_text(GTK_ENTRY(data->ort_path_entry), f->path);
     _set_ort_path(data, f->path);
     GtkWidget *dlg = gtk_message_dialog_new(
@@ -1409,8 +1413,9 @@ static void _on_detect_system_ort(GtkButton *button, gpointer user_data)
     GtkWidget *combo = gtk_combo_box_text_new();
     for(GList *l = found; l; l = g_list_next(l))
     {
-      dt_ai_ort_found_t *f = l->data;
-      gchar *entry = g_strdup_printf("ONNX Runtime %s [%s]  %s", f->version, f->eps, f->path);
+      const dt_ai_ort_found_t *f = l->data;
+      gchar *entry = g_strdup_printf("ONNX Runtime %s [%s]  %s",
+                                     f->version, f->eps, f->path);
       gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(combo), entry);
       g_free(entry);
     }
@@ -1423,7 +1428,7 @@ static void _on_detect_system_ort(GtkButton *button, gpointer user_data)
       const int sel = gtk_combo_box_get_active(GTK_COMBO_BOX(combo));
       if(sel >= 0)
       {
-        dt_ai_ort_found_t *f = g_list_nth_data(found, sel);
+        const dt_ai_ort_found_t *f = g_list_nth_data(found, sel);
         gtk_entry_set_text(GTK_ENTRY(data->ort_path_entry), f->path);
         _set_ort_path(data, f->path);
       }

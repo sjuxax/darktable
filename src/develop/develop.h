@@ -440,8 +440,8 @@ void dt_dev_toggle_preview2_pinned(dt_develop_t *dev);
 void dt_dev_pin_image(dt_develop_t *dev, dt_imgid_t imgid);
 void dt_dev_set_histogram_pre(dt_develop_t *dev);
 void dt_dev_reprocess_all(dt_develop_t *dev);
-void dt_dev_reprocess_center(dt_develop_t *dev);
-void dt_dev_reprocess_preview(dt_develop_t *dev);
+void dt_dev_reprocess_center(dt_develop_t *dev, const int32_t iop_order);
+void dt_dev_reprocess_preview(dt_develop_t *dev, const int32_t iop_order);
 
 gboolean dt_dev_get_preview_size(const dt_develop_t *dev,
                                  float *wd,
@@ -643,8 +643,8 @@ void dt_dev_image(const dt_imgid_t imgid,
                   const int32_t snapshot_id,
                   GList *module_filter_out,
                   const int devid,
-                  const gboolean finalscale);
-
+                  const gboolean finalscale,
+                  const gboolean want_float);
 
 gboolean dt_dev_equal_chroma(const float *f, const double *d);
 void dt_dev_reset_chroma(dt_develop_t *dev);

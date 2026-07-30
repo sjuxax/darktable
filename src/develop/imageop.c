@@ -15,6 +15,7 @@
     You should have received a copy of the GNU General Public License
     along with darktable.  If not, see <http://www.gnu.org/licenses/>.
 */
+#include "common/gdk_event_utils.h"
 
 #include "develop/imageop.h"
 #include "bauhaus/bauhaus.h"
@@ -829,9 +830,9 @@ static gboolean _rename_module_key_press(GtkWidget *entry,
 {
   gboolean ended = FALSE;
 
-  if(event->type == GDK_FOCUS_CHANGE
-     || event->keyval == GDK_KEY_Return
-     || event->keyval == GDK_KEY_KP_Enter)
+  if(dt_gdk_event_get_type(event) == GDK_FOCUS_CHANGE
+     || dt_gdk_event_get_keyval(event) == GDK_KEY_Return
+     || dt_gdk_event_get_keyval(event) == GDK_KEY_KP_Enter)
   {
     if(gtk_entry_get_text_length(GTK_ENTRY(entry)) > 0)
     {
@@ -859,7 +860,7 @@ static gboolean _rename_module_key_press(GtkWidget *entry,
 
     ended = TRUE;
   }
-  else if(event->keyval == GDK_KEY_Escape)
+  else if(dt_gdk_event_get_keyval(event) == GDK_KEY_Escape)
   {
     ended = TRUE;
   }
@@ -984,13 +985,13 @@ static gboolean _gui_multiinstance_callback(GtkButton *button,
                                             GdkEventButton *event,
                                             dt_iop_module_t *module)
 {
-  if(event && event->button == GDK_BUTTON_SECONDARY)
+  if(event && dt_gdk_event_get_button(event) == GDK_BUTTON_SECONDARY)
   {
     if(!(module->flags() & IOP_FLAGS_ONE_INSTANCE))
       _gui_copy_callback(button, module);
     return TRUE;
   }
-  else if(event && event->button == GDK_BUTTON_MIDDLE)
+  else if(event && dt_gdk_event_get_button(event) == GDK_BUTTON_MIDDLE)
   {
     return FALSE;
   }
@@ -2315,7 +2316,7 @@ static gboolean _gui_reset_callback(GtkButton *button,
   // Ctrl is used to apply any auto-presets to the current module
   // If Ctrl was not pressed, or no auto-presets were applied, reset the module parameters
   if(!(event
-       && dt_modifier_is(event->state, GDK_CONTROL_MASK))
+       && dt_modifier_is(dt_gdk_event_get_state(event), GDK_CONTROL_MASK))
      || !dt_gui_presets_autoapply_for_module(module, NULL))
   {
     // if a drawn mask is set, remove it from the list
@@ -2368,9 +2369,13 @@ static gboolean _presets_scroll_callback(GtkWidget *widget,
 {
   if(dt_gui_ignore_scroll(event)) return FALSE;
 
-  int delta_y = 0;
-  if(dt_gui_get_scroll_unit_delta(event, &delta_y))
-    dt_gui_presets_apply_adjacent_preset(module, delta_y);
+  // preset cycling: right==down==next
+  int delta_x = 0, delta_y = 0;
+  if(dt_gui_get_scroll_unit_deltas(event, &delta_x, &delta_y))
+  {
+    const int delta = abs(delta_x) > abs(delta_y) ? delta_x : delta_y;
+    dt_gui_presets_apply_adjacent_preset(module, delta);
+  }
 
   return TRUE;
 }
@@ -2816,7 +2821,8 @@ gboolean dt_iop_show_hide_header_buttons(dt_iop_module_t *module,
   return TRUE;
 }
 
-static void _display_mask_indicator_callback(GtkToggleButton *bt, dt_iop_module_t *module)
+static void _display_mask_indicator_callback(GtkToggleButton *bt,
+                                             dt_iop_module_t *module)
 {
   DT_GUARD_GUI_UPDATE();
 

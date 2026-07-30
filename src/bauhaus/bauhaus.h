@@ -48,6 +48,7 @@ typedef enum dt_bauhaus_type_t
   DT_BAUHAUS_BUTTON = 0,
   DT_BAUHAUS_SLIDER = 1,
   DT_BAUHAUS_COMBOBOX = 2,
+  DT_BAUHAUS_TOGGLE = 3,
   // TODO: all the fancy color sliders..
 } dt_bauhaus_type_t;
 
@@ -128,6 +129,12 @@ typedef struct dt_bauhaus_t
   // our custom signals
   guint signals[DT_BAUHAUS_LAST_SIGNAL];
 
+  // resolves to the same css as the check part of a gtk check button, so
+  // that toggles are drawn by the theme rather than from hardcoded colours
+  GtkStyleContext *check_context;
+  float check_size;                      // side of a toggle's tick box
+  GtkBorder check_margin;                // space the css keeps around it
+
   // initialise or connect accelerators in set_label
   int skip_accel;
   GHashTable *combo_introspection, *combo_list;
@@ -170,6 +177,20 @@ dt_bauhaus_type_t dt_bauhaus_widget_get_type(GtkWidget *widget);
 dt_action_t *dt_bauhaus_widget_set_label(GtkWidget *widget,
                                          const char *section,
                                          const char *label);
+// replace only the text that is drawn, for labels that carry a value read
+// from the image. The action the widget was registered under keeps the name
+// it was given, so shortcuts bound to it are unaffected
+void dt_bauhaus_widget_set_label_text(GtkWidget *widget,
+                                      const char *label);
+// how the label is shortened when it does not fit. The default is to drop
+// the end of it; a label that carries a value wants the middle dropped
+// instead, so that the value survives
+void dt_bauhaus_widget_set_label_ellipsize(GtkWidget *widget,
+                                           const PangoEllipsizeMode ellipsize);
+// where the quad is drawn, in widget coordinates, for anchoring a popup to
+// the icon rather than to the whole widget
+void dt_bauhaus_widget_get_quad_rect(GtkWidget *widget,
+                                     GdkRectangle *rect);
 const char* dt_bauhaus_widget_get_label(GtkWidget *widget);
 void dt_bauhaus_widget_hide_label(GtkWidget *widget);
 void dt_bauhaus_widget_set_show_extended_label(GtkWidget *widget,
@@ -225,6 +246,23 @@ void dt_bauhaus_update_from_field(dt_iop_module_t *module,
                                   gpointer blend_params);
 // reset widget to default value
 void dt_bauhaus_widget_reset(GtkWidget *widget);
+
+// toggle:
+GtkWidget *dt_bauhaus_toggle_new(dt_iop_module_t *self);
+GtkWidget *dt_bauhaus_toggle_from_widget(dt_bauhaus_widget_t *w,
+                                         dt_iop_module_t *self);
+// setting the value writes through to the linked field and adds a history
+// item, just like the slider and combobox setters do
+void dt_bauhaus_toggle_set(GtkWidget *widget,
+                           const gboolean active);
+gboolean dt_bauhaus_toggle_get(GtkWidget *widget);
+// the value a reset returns to, and the value the notebook tab "changed"
+// indicator compares against. Modules that compute a bool default per
+// image in reload_defaults() have to keep this up to date, as they already
+// do for sliders and comboboxes
+void dt_bauhaus_toggle_set_default(GtkWidget *widget,
+                                   const gboolean def);
+gboolean dt_bauhaus_toggle_get_default(GtkWidget *widget);
 
 // slider:
 GtkWidget *dt_bauhaus_slider_new(dt_iop_module_t *self);

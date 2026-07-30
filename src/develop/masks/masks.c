@@ -165,7 +165,10 @@ static void _set_hinter_message(const dt_masks_form_gui_t *gui,
 
   if(sel->functions && sel->functions->set_hint_message)
   {
-    sel->functions->set_hint_message(gui, form, opacity, msg, sizeof(msg));
+    // pass the selected sub-form (sel), not the outer form: when editing a
+    // group member, `form` is the group, so its type/points would not describe
+    // the shape the hint is about (e.g. whether it is a clone with a source)
+    sel->functions->set_hint_message(gui, sel, opacity, msg, sizeof(msg));
   }
 
   dt_control_hinter_message(msg);
@@ -319,6 +322,37 @@ static dt_masks_form_t *_group_from_module(const dt_develop_t *dev,
   return dt_masks_get_from_id(dev, module->blend_params->mask_id);
 }
 
+static gboolean _form_is_in_group(const dt_develop_t *dev,
+                                  const dt_masks_form_t *group,
+                                  const dt_mask_id_t maskid)
+{
+  for(const GList *iter = group->points; iter; iter = g_list_next(iter))
+  {
+    const dt_masks_point_group_t *pt = iter->data;
+    if(pt->formid == maskid) return TRUE;
+
+    const dt_masks_form_t *child = dt_masks_get_from_id(dev, pt->formid);
+    if(child && (child->type & DT_MASKS_GROUP))
+    {
+      if(_form_is_in_group(dev, child, maskid)) return TRUE;
+    }
+  }
+  return FALSE;
+}
+
+gboolean dt_masks_is_in_module(const dt_mask_id_t maskid, const dt_iop_module_t *module)
+{
+  if(!dt_is_valid_maskid(maskid) || !module) return FALSE;
+
+  if(maskid == module->blend_params->mask_id) return TRUE;
+
+  const dt_masks_form_t *root = dt_masks_get_from_id(module->dev, module->blend_params->mask_id);
+  if(root && (root->type & DT_MASKS_GROUP))
+    return _form_is_in_group(module->dev, root, maskid);
+
+  return FALSE;
+}
+
 void dt_masks_register_forms(dt_develop_t *dev,
                              GList *forms)
 {
@@ -428,6 +462,7 @@ int dt_masks_form_duplicate(dt_develop_t *dev, const dt_mask_id_t formid)
   // we copy the base values
   fdest->source[0] = fbase->source[0];
   fdest->source[1] = fbase->source[1];
+  fdest->source[2] = fbase->source[2];
   fdest->version = fbase->version;
   snprintf(fdest->name, sizeof(fdest->name), _("copy of `%s'"), fbase->name);
 
@@ -971,7 +1006,25 @@ void dt_masks_read_masks_history(dt_develop_t *dev, const dt_imgid_t imgid)
     form->version = sqlite3_column_int(stmt, 4);
     form->points = NULL;
     const int nb_points = sqlite3_column_int(stmt, 6);
-    memcpy(form->source, sqlite3_column_blob(stmt, 7), sizeof(float) * 2);
+    const int source_bytes = sqlite3_column_bytes(stmt, 7);
+    if(source_bytes == sizeof(float) * 2)
+    {
+      memcpy(form->source, sqlite3_column_blob(stmt, 7), sizeof(float) * 2);
+      form->source[2] = 0.0f;
+    }
+    else if(source_bytes == sizeof(float) * 3)
+    {
+      memcpy(form->source, sqlite3_column_blob(stmt, 7), sizeof(float) * 3);
+    }
+    else if(source_bytes == sizeof(float) * 4)
+    {
+      // migration: old format stored an unused scale field as source[3]; drop it
+      memcpy(form->source, sqlite3_column_blob(stmt, 7), sizeof(float) * 3);
+    }
+    else
+    {
+      memset(form->source, 0, sizeof(float) * 3);
+    }
 
     // and now we "read" the blob
     if(form->functions)
@@ -1060,7 +1113,7 @@ void dt_masks_write_masks_history_item(const dt_imgid_t imgid,
   DT_DEBUG_SQLITE3_BIND_INT(stmt, 2, form->formid);
   DT_DEBUG_SQLITE3_BIND_INT(stmt, 3, form->type);
   DT_DEBUG_SQLITE3_BIND_TEXT(stmt, 4, form->name, -1, SQLITE_TRANSIENT);
-  DT_DEBUG_SQLITE3_BIND_BLOB(stmt, 8, form->source, 2 * sizeof(float), SQLITE_TRANSIENT);
+  DT_DEBUG_SQLITE3_BIND_BLOB(stmt, 8, form->source, 3 * sizeof(float), SQLITE_TRANSIENT);
   DT_DEBUG_SQLITE3_BIND_INT(stmt, 5, form->version);
   if(form->functions)
   {
@@ -1129,8 +1182,7 @@ gboolean dt_masks_events_mouse_moved(dt_iop_module_t *module,
     1. a module and it's not enabled
     2. the mask manager and it is not expanded
 */
-  const gboolean skipped = (module && !module->enabled)
-                        && !dt_lib_gui_get_expanded(dt_lib_get_module("masks"));
+  const gboolean skipped = (module && !module->enabled);
 
   dt_print(DT_DEBUG_VERBOSE,
     "[dt_masks_events_mouse_moved] %s %s",
@@ -1152,9 +1204,16 @@ gboolean dt_masks_events_mouse_moved(dt_iop_module_t *module,
     gui->posy = pzy * ht;
   }
 
+  // form->points can be mutated below (dragging a node); pixelpipe worker
+  // threads deep-copy dev->forms concurrently in dt_dev_pixelpipe_process, so
+  // this must be serialized against that read (see history_mutex there).
+  dt_pthread_mutex_lock(&darktable.develop->history_mutex);
+
   int rep = 0;
   if(form->functions)
     rep = form->functions->mouse_moved(module, pzx, pzy, pressure, which, zoom_scale, form, 0, gui, 0);
+
+  dt_pthread_mutex_unlock(&darktable.develop->history_mutex);
 
   if(gui) _set_hinter_message(gui, form);
 
@@ -1177,15 +1236,18 @@ gboolean dt_masks_events_button_released(dt_iop_module_t *module,
     dt_dev_masks_selection_change(dev, module, dev->mask_form_selected_id);
   DT_LEAVE_GUI_UPDATE();
 
+  gboolean ret = FALSE;
   if(form->functions)
   {
-    const int ret =
-      form->functions->button_released(module, pzx, pzy, which, state, form, 0, gui, 0);
+    // serialized against the pixelpipe's dt_masks_dup_forms_deep read of
+    // dev->forms/form->points, see history_mutex use in dt_dev_pixelpipe_process.
+    dt_pthread_mutex_lock(&dev->history_mutex);
+    ret = form->functions->button_released(module, pzx, pzy, which, state, form, 0, gui, 0);
     form->functions->mouse_moved(module, pzx, pzy, 0, which, zoom_scale, form, 0, gui, 0);
-    return ret;
+    dt_pthread_mutex_unlock(&dev->history_mutex);
   }
 
-  return FALSE;
+  return ret;
 }
 
 gboolean dt_masks_events_button_pressed(dt_iop_module_t *module,
@@ -1223,9 +1285,16 @@ gboolean dt_masks_events_button_pressed(dt_iop_module_t *module,
   }
 
   if(form->functions)
-    return form->functions->button_pressed(module, pzx, pzy, pressure,
-                                           which, type, state, form, 0, gui, 0)
-      || which == 3; // swallow right-clicks so right-drag rotate is disabled
+  {
+    // serialized against the pixelpipe's dt_masks_dup_forms_deep read of
+    // dev->forms/form->points, see history_mutex use in dt_dev_pixelpipe_process.
+    dt_pthread_mutex_lock(&darktable.develop->history_mutex);
+    const gboolean ret = form->functions->button_pressed(
+                           module, pzx, pzy, pressure, which, type, state, form, 0, gui, 0) ||
+                         which == 3; // swallow right-clicks so right-drag rotate is disabled
+    dt_pthread_mutex_unlock(&darktable.develop->history_mutex);
+    return ret;
+  }
   return FALSE;
 }
 
@@ -1259,9 +1328,15 @@ gboolean dt_masks_events_mouse_scrolled(dt_iop_module_t *module,
   const gboolean incr = dt_mask_scroll_increases(up);
 
   if(form->functions)
+  {
+    // serialized against the pixelpipe's dt_masks_dup_forms_deep read of
+    // dev->forms/form->points, see history_mutex use in dt_dev_pixelpipe_process.
+    dt_pthread_mutex_lock(&darktable.develop->history_mutex);
     ret = (form->functions->mouse_scrolled(module, pzx, pzy,
                                           incr ? 1 : 0,
                                           state, form, 0, gui, 0)) != 0;
+    dt_pthread_mutex_unlock(&darktable.develop->history_mutex);
+  }
 
   if(gui)
   {
@@ -1346,6 +1421,8 @@ void dt_masks_clear_form_gui(const dt_develop_t *dev)
     dev->form_gui->form_dragging = dev->form_gui->form_rotating =
     dev->form_gui->border_toggling = dev->form_gui->gradient_toggling = FALSE;
   dev->form_gui->source_selected = dev->form_gui->source_dragging = FALSE;
+  dev->form_gui->source_rotating = dev->form_gui->counter_rotate_source = FALSE;
+  dev->form_gui->rotate_about_source = FALSE;
   dev->form_gui->pivot_selected = FALSE;
   dev->form_gui->point_border_selected = dev->form_gui->seg_selected =
     dev->form_gui->point_selected = dev->form_gui->feather_selected = -1;
@@ -1469,6 +1546,13 @@ void dt_masks_set_edit_mode(dt_iop_module_t *module,
   if(bd->masks_support)
     gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(bd->masks_edit),
                                  value == DT_MASKS_EDIT_OFF ? FALSE : TRUE);
+
+  // Hiding (or changing) the mask overlay shrinks the editable canvas back to
+  // the image, so a viewport that was panned to reach off-image handles is now
+  // stale. Re-validate it: this no-op clamp snaps the pan back into bounds so
+  // the picture re-centres immediately instead of lingering off-centre (which
+  // also leaves the renderer churning) until the next manual pan.
+  dt_dev_zoom_move(&darktable.develop->full, DT_ZOOM_MOVE, 0.0f, 0, 0.0f, 0.0f, TRUE);
 
   dt_control_queue_redraw_center();
 }
@@ -2059,7 +2143,7 @@ dt_hash_t dt_masks_group_hash(dt_hash_t hash, dt_masks_form_t *form)
   hash = dt_hash(hash, &form->type, sizeof(dt_masks_type_t));
   hash = dt_hash(hash, &form->formid, sizeof(dt_mask_id_t));
   hash = dt_hash(hash, &form->version, sizeof(int));
-  hash = dt_hash(hash, &form->source, sizeof(float) * 2);
+  hash = dt_hash(hash, &form->source, sizeof(float) * 3);
 
   for(const GList *forms = form->points; forms; forms = g_list_next(forms))
   {
@@ -2798,6 +2882,49 @@ void dt_masks_closest_point(const int count,
       dist = d;
     }
   }
+}
+
+void dt_masks_rotate_ctrl_points(dt_develop_t *dev,
+                                 const float *const gpt_points,
+                                 const int points_count,
+                                 const int nb,
+                                 const float cx,
+                                 const float cy,
+                                 const float cos_a,
+                                 const float sin_a,
+                                 const float iwidth,
+                                 const float iheight,
+                                 float *const out)
+{
+  // the control points are the first nb*3 (x,y) pairs of the display buffer
+  const int nctrl = nb * 3;
+  if(nctrl < 1 || points_count < nctrl)
+    return;
+
+  // rotate every control point around the screen pivot into a scratch buffer,
+  // then back-transform the whole batch in one pipe traversal (cheaper and more
+  // accurate than inverting the pipe per point)
+  float *const scr = dt_alloc_align_float((size_t)nctrl * 2);
+  if(!scr)
+    return;
+
+  for(int i = 0; i < nctrl; i++)
+  {
+    const float rx = gpt_points[i * 2] - cx;
+    const float ry = gpt_points[i * 2 + 1] - cy;
+    scr[i * 2] = cx + rx * cos_a - ry * sin_a;
+    scr[i * 2 + 1] = cy + rx * sin_a + ry * cos_a;
+  }
+
+  dt_dev_distort_backtransform(dev, scr, nctrl);
+
+  for(int i = 0; i < nctrl; i++)
+  {
+    out[i * 2] = scr[i * 2] / iwidth;
+    out[i * 2 + 1] = scr[i * 2 + 1] / iheight;
+  }
+
+  dt_free_align(scr);
 }
 
 void dt_masks_line_stroke(cairo_t *cr,

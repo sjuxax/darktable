@@ -232,6 +232,21 @@ typedef struct dt_masks_functions_t
                           int *count,
                           float *min,
                           float *max);
+  // grow/shrink (outset/inset) a shape to a signed absolute amount in the given
+  // unit (use_percent: TRUE = % of shape size, FALSE = image pixels), measured
+  // from a baseline captured the first time the shape is resized. Positive grows,
+  // negative shrinks, 0 restores the baseline. Results are cached per offset, so
+  // re-requesting a value is lossless. Returns TRUE if a usable shape resulted.
+  // Currently only implemented by path masks.
+  gboolean (*resize)(struct dt_masks_form_t *const form,
+                     const int amount,
+                     const gboolean use_percent);
+  // report the resize offset currently applied to the shape, in the requested
+  // unit, so a UI control can mirror it. Returns FALSE (amount 0) if no resize is
+  // active. Currently only implemented by path masks.
+  gboolean (*resize_get)(struct dt_masks_form_t *const form,
+                         const gboolean use_percent,
+                         float *amount);
   void (*duplicate_points)(dt_develop_t *const dev,
                            struct dt_masks_form_t *base,
                            struct dt_masks_form_t *dest);
@@ -346,8 +361,8 @@ typedef struct dt_masks_form_t
   dt_masks_type_t type;
   const dt_masks_functions_t *functions;
 
-  // position of the source (used only for clone)
-  float source[2];
+  // position of the source (used only for clone). [0]=dx, [1]=dy, [2]=angle
+  float source[3];
   // name of the form
   char name[128];
   // id used to store the form
@@ -401,6 +416,14 @@ typedef struct dt_masks_form_gui_t
   gboolean form_selected;
   gboolean border_selected;
   gboolean source_selected;
+  gboolean source_rotating;
+  gboolean counter_rotate_source;
+  // joint rotation grabbed from the source shape: the mouse circles the source,
+  // so its angular sweep must be measured about the source centroid (not the
+  // destination centroid) to keep the rotation gain symmetric with grabbing the
+  // target. The applied angle is identical either way; only the pivot used to
+  // read the mouse motion differs.
+  gboolean rotate_about_source;
   gboolean pivot_selected;
   gboolean select_only_border;
   dt_masks_edit_mode_t edit_mode;
@@ -560,6 +583,8 @@ void dt_masks_replace_current_forms(dt_develop_t *dev, GList *forms);
 dt_masks_form_t *dt_masks_get_from_id_ext(GList *forms, dt_mask_id_t id);
 /** returns a form with formid == id from dev->forms */
 dt_masks_form_t *dt_masks_get_from_id(const dt_develop_t *dev, dt_mask_id_t id);
+/** check if a form is used by a given module (directly or as a child of its group) */
+gboolean dt_masks_is_in_module(dt_mask_id_t maskid, const struct dt_iop_module_t *module);
 /** register forms into the mask manager */
 void dt_masks_register_forms(dt_develop_t *dev,
                              GList *forms);
@@ -1136,6 +1161,26 @@ void dt_masks_closest_point(const int count,
                             const float py,
                             float *x,
                             float *y);
+
+/* Rotate the control points of a path/brush outline in screen space and project
+   them back to normalized image coordinates. `gpt_points` is the gui display
+   buffer (interleaved x,y) whose first `nb*3` pairs are the control points,
+   stored per node as ctrl1, corner, ctrl2; `points_count` is its number of
+   (x,y) pairs. Each control point is rotated by (cos_a, sin_a) around the screen
+   pivot (cx, cy), back-transformed through the pipe in a single batch, and
+   written to `out` (normalized, same interleaving, nb*6 floats). Shared by the
+   path and brush rotate gestures. */
+void dt_masks_rotate_ctrl_points(dt_develop_t *dev,
+                                 const float *const gpt_points,
+                                 const int points_count,
+                                 const int nb,
+                                 const float cx,
+                                 const float cy,
+                                 const float cos_a,
+                                 const float sin_a,
+                                 const float iwidth,
+                                 const float iheight,
+                                 float *const out);
 
 /* draw a line from -> to with an arrow at the end.
    if touch_dest is true then the arrow will be at the

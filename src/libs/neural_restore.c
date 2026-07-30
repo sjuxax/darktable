@@ -15,6 +15,7 @@
     You should have received a copy of the GNU General Public License
     along with darktable.  If not, see <http://www.gnu.org/licenses/>.
 */
+#include "common/gdk_event_utils.h"
 
 // neural restore — lighttable module for AI-based image restoration
 //
@@ -201,6 +202,8 @@
 #include "common/film.h"
 #include "common/grouping.h"
 #include "common/image_cache.h"
+#include "common/colorlabels.h"
+#include "common/metadata.h"
 #include "common/mipmap_cache.h"
 #include "common/tags.h"
 #include "control/jobs/control_jobs.h"
@@ -1002,6 +1005,45 @@ static void _import_image(const char *filename,
     dt_print(DT_DEBUG_AI, "[neural_restore] imported imgid=%d: %s", newid, filename);
     if(dt_is_valid_imgid(source_imgid))
     {
+      // retrieve and copy image rating from the source image
+      const dt_image_t *src_rate = dt_image_cache_get(source_imgid, 'r');
+      const int rating = dt_image_get_xmp_rating(src_rate);
+      dt_image_cache_read_release(src_rate);
+      dt_image_t *img = dt_image_cache_get(newid, 'w');
+      dt_image_set_xmp_rating(img, rating);
+      dt_image_cache_write_release(img, DT_IMAGE_CACHE_SAFE);
+
+      // retrieve and copy color labels from the source image
+      const int color_labels = dt_colorlabels_get_labels(source_imgid);
+      for(int color = 0; color < DT_COLORLABELS_LAST; color++)
+      {
+        if(color_labels & (1 << color))
+        {
+          dt_colorlabels_set_label(newid, color);
+        }
+      }
+
+      // retrieve and copy manual geolocation metadata
+      dt_image_geoloc_t geoloc;
+      geoloc.longitude = NAN;
+      geoloc.latitude = NAN;
+      geoloc.elevation = NAN;
+      dt_image_get_location(source_imgid, &geoloc);
+      if(!isnan(geoloc.longitude) && !isnan(geoloc.latitude))
+      {
+        dt_image_set_location(newid, &geoloc, FALSE, FALSE);
+      }
+
+      // retrieve and copy database-only metadata like title, description, etc.
+      GList *meta = dt_metadata_get_list_id(source_imgid);
+      if(meta)
+      {
+        GList *imgs = g_list_prepend(NULL, GINT_TO_POINTER(newid));
+        dt_metadata_set_list_id(imgs, meta, FALSE, FALSE);
+        g_list_free(imgs);
+        g_list_free_full(meta, g_free);
+      }
+
       dt_grouping_add_to_group(source_imgid, newid);
       // promote the output as group leader, but only when the source
       // was the current leader — preserves any manually-set leader the
@@ -1023,6 +1065,9 @@ static void _import_image(const char *filename,
         g_list_free(targets);
       }
       dt_tag_free_result(&src_tags);
+
+      // sync metadata changes to sidecar files and trigger UI updates
+      dt_image_synch_xmp(newid);
     }
     // refresh the collection so the new image appears in the thumb grid
     dt_collection_update_query(darktable.collection,
@@ -1071,6 +1116,8 @@ static gboolean _job_finished_idle(gpointer data)
     for(GList *l = fd->images; l; l = g_list_next(l))
       g_hash_table_remove(d->processing_images, l->data);
     _update_button_sensitivity(d);
+    if (fd->images)
+      DT_CONTROL_SIGNAL_RAISE(DT_SIGNAL_METADATA_CHANGED, DT_METADATA_SIGNAL_NEW_VALUE);
   }
   g_list_free(fd->images);
   g_free(fd);
@@ -1695,6 +1742,19 @@ static void _update_info_label(dt_lib_neural_restore_t *d)
     snprintf(d->info_text_left, sizeof(d->info_text_left), "%s",
              is_bayer_out ? _("output: Bayer CFA DNG")
                           : _("output: LinearRaw DNG"));
+  }
+
+  // 4BAYER preview shows no denoise effect (no RGB→CFA mapping)
+  if(d->task == NEURAL_TASK_RAW_DENOISE && dt_is_valid_imgid(imgid))
+  {
+    const dt_image_t *cached = dt_image_cache_get(imgid, 'r');
+    if(cached)
+    {
+      if(cached->flags & DT_IMAGE_4BAYER)
+        snprintf(d->warning_text, sizeof(d->warning_text), "%s",
+                 _("preview unavailable – process to save result"));
+      dt_image_cache_read_release(cached);
+    }
   }
 
   // gamut note (informational, not a warning): reuse the same info
@@ -3445,7 +3505,7 @@ static gboolean _pick_double_click(GtkWidget *widget,
                                    GdkEventButton *event,
                                    dt_lib_module_t *self)
 {
-  if(event->type != GDK_2BUTTON_PRESS) return FALSE;
+  if(dt_gdk_event_get_type(event) != GDK_2BUTTON_PRESS) return FALSE;
   dt_lib_neural_restore_t *d = self->data;
   d->patch_center[0] = 0.5f;
   d->patch_center[1] = 0.5f;

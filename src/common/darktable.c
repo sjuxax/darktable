@@ -727,11 +727,11 @@ static int32_t _detect_opencl_job_run(dt_job_t *job)
   return 0;
 }
 
-static dt_job_t *_detect_opencl_job_create(gboolean exclude_opencl)
+static dt_job_t *_detect_opencl_job_create(int options)
 {
   dt_job_t *job = dt_control_job_create(&_detect_opencl_job_run, "detect opencl devices");
   if(!job) return NULL;
-  dt_control_job_set_params(job, GINT_TO_POINTER(exclude_opencl), NULL);
+  dt_control_job_set_params(job, GINT_TO_POINTER(options), NULL);
   return job;
 }
 
@@ -1022,10 +1022,10 @@ int dt_init(int argc,
   darktable.tmp_directory = NULL;
   darktable.bench_module = NULL;
 
-  gboolean exclude_opencl = TRUE;
+  int options = DT_OPENCL_OPTION_EXCLUDE;
   gboolean print_statistics = FALSE;
 #ifdef HAVE_OPENCL
-  exclude_opencl = FALSE;
+  options = DT_OPENCL_OPTION_NONE;
   print_statistics = (strstr(argv[0], "darktable-cltest") == NULL);
 #endif
 
@@ -1331,7 +1331,7 @@ int dt_init(int argc,
       else if(!strcmp(argv[k], "--disable-opencl"))
       {
 #ifdef HAVE_OPENCL
-        exclude_opencl = TRUE;
+        options |= DT_OPENCL_OPTION_EXCLUDE;
 #endif
         argv[k] = NULL;
       }
@@ -1845,6 +1845,7 @@ int dt_init(int argc,
   size_t total_mb = _get_total_memory() / 1024lu;
   if(total_mb < 8192) total_mb -= 1024;
   res->total_memory = total_mb * DT_MEGA;
+  res->cl_uni_memory = 0;
 
   char *config_info = calloc(1, DT_PERF_INFOSIZE);
   if(last_configure_version != DT_CURRENT_PERFORMANCE_CONFIGURE_VERSION
@@ -1907,9 +1908,9 @@ int dt_init(int argc,
 
   // Only then kick off the OpenCL background job
   if(init_gui)
-    dt_control_add_job(DT_JOB_QUEUE_SYSTEM_BG, _detect_opencl_job_create(exclude_opencl));
+    dt_control_add_job(DT_JOB_QUEUE_SYSTEM_BG, _detect_opencl_job_create(options));
   else
-    dt_opencl_init(darktable.opencl, exclude_opencl, print_statistics);
+    dt_opencl_init(darktable.opencl, options, print_statistics);
 
   // must come before mipmap_cache, because that one will need to access image dimensions stored in here:
   dt_image_cache_init();
@@ -2097,11 +2098,9 @@ int dt_init(int argc,
   dt_capabilities_add("nonapple");
 #elif defined(__APPLE__)
   dt_capabilities_add("apple");
-  dt_capabilities_add("nonwindows");
 #else
   dt_capabilities_add("linux");
   dt_capabilities_add("nonapple");
-  dt_capabilities_add("nonwindows");
 #endif
 
   dt_print(DT_DEBUG_CONTROL,
@@ -2474,7 +2473,7 @@ size_t dt_get_available_mem()
     return res->refresource[4*(-level-1)] * DT_MEGA;
 
   const int fraction = res->fractions[4*level];
-  return MAX(512lu * DT_MEGA, res->total_memory / 1024lu * fraction);
+  return MAX(512lu * DT_MEGA, (res->total_memory - res->cl_uni_memory) / 1024lu * fraction);
 }
 
 size_t dt_get_singlebuffer_mem()

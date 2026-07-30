@@ -15,6 +15,7 @@
     You should have received a copy of the GNU General Public License
     along with darktable.  If not, see <http://www.gnu.org/licenses/>.
 */
+#include "common/gdk_event_utils.h"
 
 #include "libs/lib.h"
 #include "common/debug.h"
@@ -129,7 +130,7 @@ static void _set_module_preset_label(dt_lib_module_t *module,
 {
   if(!module->expander || !module->has_preset_label(module))
     return;
-  
+
   const gchar *current_preset_label_text = gtk_label_get_text(GTK_LABEL(module->preset_label));
   gchar *preset_label_text =
     (*preset_name == '\0' || (!dt_conf_get_bool("darkroom/ui/auto_module_name_update")))?
@@ -382,8 +383,8 @@ gboolean dt_lib_presets_apply(const gchar *preset,
   if(sqlite3_step(stmt) == SQLITE_ROW)
   {
     const void *blob = sqlite3_column_blob(stmt, 0);
-    int length = sqlite3_column_bytes(stmt, 0);
-    int writeprotect = sqlite3_column_int(stmt, 1);
+    const int length = sqlite3_column_bytes(stmt, 0);
+    const int writeprotect = sqlite3_column_int(stmt, 1);
     if(blob)
     {
       for(const GList *it = darktable.lib->plugins; it; it = g_list_next(it))
@@ -452,7 +453,7 @@ static gboolean _menuitem_button_preset(GtkMenuItem *menuitem,
                                         GdkEventButton *event,
                                         dt_lib_module_info_t *minfo)
 {
-  if(event->button == GDK_BUTTON_PRIMARY) return FALSE;
+  if(dt_gdk_event_get_button(event) == GDK_BUTTON_PRIMARY) return FALSE;
 
   dt_shortcut_copy_lua((dt_action_t*)minfo->module,
                         g_object_get_data(G_OBJECT(menuitem), "dt-preset-name"));
@@ -987,7 +988,7 @@ static gboolean _presets_popup_callback(GtkButton *button,
   return TRUE;
 }
 
-void dt_lib_gui_set_expanded(dt_lib_module_t *module, gboolean expanded)
+void dt_lib_gui_set_expanded(dt_lib_module_t *module, const gboolean expanded)
 {
   if(!module->expander || !module->arrow) return;
 
@@ -999,6 +1000,10 @@ void dt_lib_gui_set_expanded(dt_lib_module_t *module, gboolean expanded)
                          flags, NULL);
 
   darktable.lib->gui_module = expanded ? module : NULL;
+
+  /* if expanded, make sure the module is visible */
+  if(module->expanded_state)
+    module->expanded_state(module, expanded);
 
   /* store expanded state of module */
   char var[1024];
@@ -1746,7 +1751,7 @@ gboolean dt_handle_dialog_enter(GtkWidget *widget,
                                 GdkEventKey *event,
                                 gpointer data)
 {
-  if(event->keyval == GDK_KEY_Return || event->keyval == GDK_KEY_KP_Enter)
+  if(dt_gdk_event_get_keyval(event) == GDK_KEY_Return || dt_gdk_event_get_keyval(event) == GDK_KEY_KP_Enter)
   {
     gtk_dialog_response(GTK_DIALOG(widget), GTK_RESPONSE_ACCEPT);
     return TRUE;
