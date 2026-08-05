@@ -31,6 +31,8 @@
 #include "common/darktable.h"
 #include "develop/imageop.h"
 
+typedef struct dt_action_def_t dt_action_def_t;
+
 typedef enum _iop_color_picker_flags_t
 {
   // at least one of point or area must be used
@@ -71,6 +73,9 @@ typedef struct dt_iop_color_picker_t
 
 
 gboolean dt_iop_color_picker_is_visible(const dt_develop_t *dev);
+
+// Action definition that executes the same picker setup as a pointer click.
+extern const dt_action_def_t dt_action_def_color_picker;
 
 //* reset current color picker if not keep-active or not keep */
 void dt_iop_color_picker_reset(dt_iop_module_t *module,

@@ -23,6 +23,17 @@
 #include "control/control.h"
 #include "gui/gtk.h"
 #include "develop/blend.h"
+#include "gui/accelerators.h"
+
+#define COLOR_PICKER_DATA_KEY "dt-color-picker"
+#define COLOR_PICKER_PENDING_KEY "dt-color-picker-pending"
+
+typedef struct dt_color_picker_action_request_t
+{
+  GtkWidget *button;
+  dt_action_effect_t effect;
+  float move_size;
+} dt_color_picker_action_request_t;
 
 /*
   The color_picker_proxy code is an interface which links the UI
@@ -151,6 +162,8 @@ static void _init_picker(dt_iop_color_picker_t *picker,
   picker->fixed_cst   = FALSE;
   picker->initialized = FALSE;
 
+  g_object_set_data(G_OBJECT(button), COLOR_PICKER_DATA_KEY, picker);
+
   _color_picker_reset(picker);
 }
 
@@ -255,6 +268,91 @@ static gboolean _color_picker_callback_button_press(GtkWidget *button,
 
   return TRUE;
 }
+
+
+static gboolean _color_picker_action_finish(gpointer user_data)
+{
+  dt_color_picker_action_request_t *request = user_data;
+  GtkWidget *button = request->button;
+  dt_iop_color_picker_t *picker =
+    g_object_get_data(G_OBJECT(button), COLOR_PICKER_DATA_KEY);
+
+  g_object_set_data(G_OBJECT(button), COLOR_PICKER_PENDING_KEY, NULL);
+  if(picker)
+  {
+    const gboolean active = darktable.lib->proxy.colorpicker.picker_proxy == picker;
+    if(DT_ACTION_TOGGLE_NEEDED(request->effect, request->move_size, active))
+    {
+      GdkEventButton event = { 0 };
+      event.state = (request->effect == DT_ACTION_EFFECT_TOGGLE_CTRL
+                     || request->effect == DT_ACTION_EFFECT_ON_CTRL)
+                  ? GDK_CONTROL_MASK : 0;
+      event.button = (request->effect == DT_ACTION_EFFECT_TOGGLE_RIGHT
+                      || request->effect == DT_ACTION_EFFECT_ON_RIGHT)
+                   ? GDK_BUTTON_SECONDARY : GDK_BUTTON_PRIMARY;
+      _color_picker_callback_button_press(button, &event, picker);
+    }
+  }
+
+  g_object_unref(button);
+  g_free(request);
+  return G_SOURCE_REMOVE;
+}
+
+
+static float _action_process_color_picker(gpointer target,
+                                          dt_action_element_t element,
+                                          dt_action_effect_t effect,
+                                          float move_size)
+{
+  (void)element;
+  GtkWidget *button = GTK_WIDGET(target);
+  dt_iop_color_picker_t *picker =
+    g_object_get_data(G_OBJECT(button), COLOR_PICKER_DATA_KEY);
+  dt_color_picker_action_request_t *pending =
+    g_object_get_data(G_OBJECT(button), COLOR_PICKER_PENDING_KEY);
+  const gboolean active = picker && darktable.lib->proxy.colorpicker.picker_proxy == picker;
+
+  if(!picker) return DT_ACTION_NOT_VALID;
+  if(!DT_PERFORM_ACTION(move_size)) return active || pending;
+
+  if(pending)
+  {
+    pending->effect = effect;
+    pending->move_size = move_size;
+    return TRUE;
+  }
+
+  if(!DT_ACTION_TOGGLE_NEEDED(effect, move_size, active)) return active;
+
+  // Picker setup dirties the preview pipe. If the module was collapsed,
+  // starting that pipe immediately after requesting focus can deliver the
+  // sample while the module GUI still rejects updates. Finish activation on
+  // a later main-loop turn, after the focus transaction has settled.
+  if(picker->module && dt_dev_gui_module() != picker->module)
+    dt_iop_request_focus(picker->module);
+
+  pending = g_malloc0(sizeof(*pending));
+  pending->button = g_object_ref(button);
+  pending->effect = effect;
+  pending->move_size = move_size;
+  g_object_set_data(G_OBJECT(button), COLOR_PICKER_PENDING_KEY, pending);
+  g_timeout_add_full(G_PRIORITY_DEFAULT_IDLE, 100, _color_picker_action_finish,
+                     pending, NULL);
+
+  return TRUE;
+}
+
+
+static const dt_action_element_def_t _action_elements_color_picker[] =
+  { { NULL, dt_action_effect_toggle } };
+
+const dt_action_def_t dt_action_def_color_picker =
+  { N_("toggle"),
+    _action_process_color_picker,
+    _action_elements_color_picker,
+    NULL,
+    TRUE };
 
 static void _color_picker_callback(GtkWidget *button,
                                    dt_iop_color_picker_t *self)
@@ -390,6 +488,8 @@ static void _color_picker_destroy(dt_iop_color_picker_t *picker)
   // before freeing the struct to prevent use-after-free in dt_iop_color_picker_reset.
   if(darktable.lib && darktable.lib->proxy.colorpicker.picker_proxy == picker)
     darktable.lib->proxy.colorpicker.picker_proxy = NULL;
+  if(picker->colorpick)
+    g_object_set_data(G_OBJECT(picker->colorpick), COLOR_PICKER_DATA_KEY, NULL);
   g_free(picker);
 }
 
