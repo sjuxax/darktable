@@ -1794,8 +1794,9 @@ static void _tree_view(dt_lib_collect_rule_t *dr)
             dt_util_str_cat(&pth, format_separator, tokens[i]);
 
           // if we are at the end of the path, and this is a folder, we need to
-          // add the count to all parents.
-          if(!tokens[common_length]
+          // add the count to all parents. common_length == 0 means 'parent' was
+          // never set to a valid node, and there is no node to update anyway.
+          if(common_length > 0 && !tokens[common_length]
              && property == DT_COLLECTION_PROP_FOLDERS)
           {
             _update_parent_count(model, &parent, count);
@@ -1824,8 +1825,11 @@ static void _tree_view(dt_lib_collect_rule_t *dr)
                 || _is_time_property(property)) && !*(token + 1))
             {
               GtkTreeIter p;
-              gtk_tree_model_iter_parent(model, &p, &iter);
-              _update_parent_count(model, &p, count);
+              // a top-level node has no parent: gtk_tree_model_iter_parent
+              // then returns FALSE and leaves 'p' uninitialized, so passing it
+              // on would cause a crash when dereferenced later
+              if(gtk_tree_model_iter_parent(model, &p, &iter))
+                _update_parent_count(model, &p, count);
             }
 
             common_length++;
@@ -3609,7 +3613,7 @@ static void popup_button_callback_cb(GtkGestureSingle *gesture, int n_press,
                                          double x, double y,
                                          dt_lib_collect_rule_t *d)
 {
-  if(gtk_gesture_single_get_button(gesture) != 1)
+  if(gtk_gesture_single_get_current_button(gesture) != 1)
     return;
 
   GtkWidget *menu = gtk_menu_new();
@@ -4380,7 +4384,9 @@ void init(struct dt_lib_module_t *self)
   luaA_enum_value(L, dt_collection_properties_t, DT_COLLECTION_PROP_LOCAL_COPY);
   luaA_enum_value(L, dt_collection_properties_t, DT_COLLECTION_PROP_MODULE);
   luaA_enum_value(L, dt_collection_properties_t, DT_COLLECTION_PROP_ORDER);
+  luaA_enum_value(L, dt_collection_properties_t, DT_COLLECTION_PROP_DUPLICATES);
   luaA_enum_value(L, dt_collection_properties_t, DT_COLLECTION_PROP_MONTH);
+  luaA_enum_value(L, dt_collection_properties_t, DT_COLLECTION_PROP_DIMENSIONS);
 }
 #endif
 #undef MAX_RULES

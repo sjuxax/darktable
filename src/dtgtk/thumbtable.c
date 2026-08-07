@@ -31,6 +31,7 @@
 #include "control/control.h"
 #include "gui/accelerators.h"
 #include "gui/drag_and_drop.h"
+#include "gui/gtk.h"
 #include "views/view.h"
 #include "bauhaus/bauhaus.h"
 
@@ -1392,14 +1393,18 @@ static void _event_leave_cb(GtkEventControllerMotion *controller,
 
   table->mouse_inside = FALSE;
 
-  // check crossing detail: don't clear mouse_over_id when leaving to
-  // a child widget (thumbnail) or due to a grab
+  /* Don't clear the mouse-over when leaving to a child widget (thumbnail),
+   * or while the pointer is grabbed: the shortcut machinery's synthetic
+   * crossings must not lose the hovered image (see #21729).
+   * GTK4 migration: drop the pointer-grab check (see
+   * dt_gui_pointer_is_grabbed()) -- GTK4 has no grabs. */
   GdkEvent *event = gtk_get_current_event();
   if(event)
   {
     if(event->crossing.detail != GDK_NOTIFY_INFERIOR
        && event->crossing.mode != GDK_CROSSING_GTK_GRAB
-       && event->crossing.mode != GDK_CROSSING_GRAB)
+       && event->crossing.mode != GDK_CROSSING_GRAB
+       && !dt_gui_pointer_is_grabbed())
       dt_control_set_mouse_over_id(NO_IMGID);
     gdk_event_free(event);
   }
@@ -1412,12 +1417,20 @@ static void _event_enter_cb(GtkEventControllerMotion *controller,
 {
   dt_set_backthumb_time(0.0);
 
-  // when entering the thumbtable area from a child thumbnail (INFERIOR),
-  // clear the mouse-over id since we're now in the empty area
+  /* The pointer entered the thumbtable area (from a thumbnail, a panel, or
+   * after a redraw of the table).  Clear the mouse-over only if the pointer
+   * landed on the table itself; if it landed on a thumbnail, the thumbnail's
+   * own enter handler sets it.  Hit-testing the pointer instead of trusting
+   * the crossing detail is required: redraws under the pointer make GDK
+   * report VIRTUAL/NONLINEAR details instead of INFERIOR, which would
+   * otherwise leave a stale hovered image (see #21729). */
   GdkEvent *event = gtk_get_current_event();
   if(event)
   {
-    if(event->crossing.detail == GDK_NOTIFY_INFERIOR)
+    /* GTK4 migration: drop the pointer-grab check (see
+     * dt_gui_pointer_is_grabbed()) -- GTK4 has no grabs. */
+    if(!dt_gui_pointer_is_grabbed()
+       && !_thumb_get_at_pos(table, (int)x, (int)y))
       dt_control_set_mouse_over_id(NO_IMGID);
     gdk_event_free(event);
   }
@@ -1556,6 +1569,17 @@ static void _event_motion_notify_cb(GtkEventControllerMotion *controller,
 
   table->mouse_inside = TRUE;
 
+  /* The pointer is over the table itself (not a thumbnail): make sure no
+   * stale image stays hovered.  The enter/leave crossings cannot be relied
+   * on here -- redraws under the pointer make GDK miss the crossing from a
+   * thumbnail into the table area (see #21729).
+   * GTK4 migration: drop the pointer-grab check (see
+   * dt_gui_pointer_is_grabbed()) -- GTK4 has no grabs. */
+  if(!table->dragging
+     && !dt_gui_pointer_is_grabbed()
+     && !_thumb_get_at_pos(table, (int)x, (int)y))
+    dt_control_set_mouse_over_id(NO_IMGID);
+
   // get root coordinates for drag tracking
   const GdkEvent *current = gtk_get_current_event();
   gdouble root_x = 0, root_y = 0;
@@ -1604,6 +1628,9 @@ static void _event_button_release_cb(GtkGestureSingle *gesture,
 
   if(dt_is_valid_imgid(id))
   {
+    /* the keyboard cursor continues from the image we clicked on */
+    table->key_pos = id;
+
     if(dt_modifier_is(state, GDK_CONTROL_MASK)
        || dt_modifier_is(state, GDK_MOD2_MASK)) // CMD key on macOS
     {
@@ -2598,11 +2625,26 @@ dt_thumbtable_t *dt_thumbtable_new()
   g_free(cl);
 
   table->offset = MAX(1, dt_conf_get_int("plugins/lighttable/collect/history_pos0"));
+  table->key_pos = NO_IMGID;
 
   // set widget signals
+#if !GTK_CHECK_VERSION(4, 0, 0)
+  /* GTK3: event controllers don't request input events from GDK -- the
+   * motion controller's event mask is 0 and gestures only request touch
+   * events -- so the widget must keep its own event mask or it never
+   * receives enter/leave/motion/button events at all (the GtkLayout bin
+   * window only adds exposure/scroll masks on top of this).  Without
+   * them, hover tracking (mouse_inside / mouse_over_id) breaks in the
+   * culling and file-manager layouts, and clicks on empty areas are
+   * dropped.
+   * GTK4 migration: delete this call -- GTK4 delivers all input events
+   * to every widget automatically. */
   gtk_widget_set_events(table->widget,
-                        GDK_EXPOSURE_MASK
-                        | GDK_STRUCTURE_MASK);
+                        GDK_EXPOSURE_MASK | GDK_POINTER_MOTION_MASK
+                        | GDK_BUTTON_PRESS_MASK | GDK_BUTTON_RELEASE_MASK
+                        | GDK_STRUCTURE_MASK
+                        | GDK_ENTER_NOTIFY_MASK | GDK_LEAVE_NOTIFY_MASK);
+#endif
   dt_gui_add_class(table->widget, "dt_transparent_background");
   gtk_widget_set_can_focus(table->widget, TRUE);
 
@@ -2634,7 +2676,7 @@ dt_thumbtable_t *dt_thumbtable_new()
    * gesture (meaning it came from this bridge) and uses GDK_BUTTON_PRIMARY.
    *
    * GTK4 migration: remove this call.  GtkGestureClick handles n_press
-   * natively and the callback can use gtk_gesture_single_get_button()
+   * natively and the callback can use gtk_gesture_single_get_current_button()
    * safely on the real gesture pointer. */
   dt_gui_connect_double_click(table->widget, _event_button_press_cb, table);
 
@@ -3345,17 +3387,42 @@ gboolean dt_thumbtable_check_imgid_visibility(dt_thumbtable_t *table,
   return FALSE;
 }
 
+// get the image the keyboard navigation should continue from: the last image
+// the keyboard navigated to (key_pos), falling back to the last single-selected
+// image, then the mouse hover -- so a stationary mouse cannot move the keyboard
+// cursor
+static dt_imgid_t _thumb_key_base(dt_thumbtable_t *table)
+{
+  const dt_imgid_t keyid = table->key_pos;
+  const dt_imgid_t selid = dt_selection_get_last_single_id(darktable.selection);
+  return dt_is_valid_imgid(keyid) && _thumb_get_rowid(keyid) > 0 ? keyid
+       : dt_is_valid_imgid(selid) && _thumb_get_rowid(selid) > 0 ? selid
+       : dt_control_get_mouse_over_id();
+}
+
+// move the selection to imgid (plain navigation) or extend it from the fixed
+// anchor (shift navigation), keeping the keyboard cursor on it
+static void _thumb_key_select(dt_thumbtable_t *table,
+                              const dt_imgid_t imgid,
+                              const gboolean select)
+{
+  if(!dt_is_valid_imgid(imgid)) return;
+  if(select)
+    dt_selection_select_range(darktable.selection, imgid);
+  else
+    dt_selection_select_single(darktable.selection, imgid);
+  table->key_pos = imgid;
+}
+
 static gboolean _filemanager_key_move(dt_thumbtable_t *table,
                                       const dt_thumbtable_move_t move,
                                       const gboolean select)
 {
-  // base point
-  dt_imgid_t baseid = dt_control_get_mouse_over_id();
+  /* the keyboard cursor is anchored on the real selection, not the mouse
+   * hover */
+  dt_imgid_t baseid = _thumb_key_base(table);
   const gboolean first_move = (baseid <= 0);
   int newrowid = -1;
-  // let's be sure that the current image is selected
-  if(dt_is_valid_imgid(baseid) && select)
-    dt_selection_select(darktable.selection, baseid);
 
   int baserowid = 1;
 
@@ -3438,9 +3505,8 @@ static gboolean _filemanager_key_move(dt_thumbtable_t *table,
   if(newrowid != -1)
     _filemanager_ensure_rowid_visibility(table, newrowid);
 
-  // if needed, we set the selection
-  if(select && dt_is_valid_imgid(imgid))
-    dt_selection_select_range(darktable.selection, imgid);
+  // move the selection with the keyboard
+  _thumb_key_select(table, imgid, select);
   return TRUE;
 }
 
@@ -3448,11 +3514,6 @@ static gboolean _zoomable_key_move(dt_thumbtable_t *table,
                                    const dt_thumbtable_move_t move,
                                    const gboolean select)
 {
-  // let's be sure that the current image is selected
-  const dt_imgid_t baseid = dt_control_get_mouse_over_id();
-  if(dt_is_valid_imgid(baseid) && select)
-    dt_selection_select(darktable.selection, baseid);
-
   // first, we move the view by 1 thumb_size
   // move step
   const int step = table->thumb_size;
@@ -3501,10 +3562,11 @@ static gboolean _zoomable_key_move(dt_thumbtable_t *table,
   // and we set mouseover if we can
   dt_thumbnail_t *thumb = _thumb_get_under_mouse(table);
   if(thumb)
+  {
     dt_control_set_mouse_over_id(thumb->imgid);
-  // if needed, we set the selection
-  if(thumb && select)
-    dt_selection_select_range(darktable.selection, thumb->imgid);
+    // move the selection with the keyboard
+    _thumb_key_select(table, thumb->imgid, select);
+  }
 
   // and we record new positions values
   const dt_thumbnail_t *first = table->list->data;
