@@ -211,8 +211,7 @@ gboolean dt_dev_pixelpipe_init_export(dt_dev_pixelpipe_t *pipe,
                                       const gboolean store_masks)
 {
   const gboolean res =
-    dt_dev_pixelpipe_init_cached(pipe, sizeof(float) * 4 * width * height,
-                                 DT_PIPECACHE_MIN, 0);
+    dt_dev_pixelpipe_init_cached(pipe, sizeof(float) * 4 * width * height, DT_PIPECACHE_MIN, 0);
   pipe->type = DT_DEV_PIXELPIPE_EXPORT;
   pipe->levels = levels;
   pipe->store_all_raster_masks = store_masks;
@@ -224,8 +223,7 @@ gboolean dt_dev_pixelpipe_init_thumbnail(dt_dev_pixelpipe_t *pipe,
                                          const int32_t height)
 {
   const gboolean res =
-    dt_dev_pixelpipe_init_cached(pipe, sizeof(float) * 4 * width * height,
-                                 DT_PIPECACHE_MIN, 0);
+    dt_dev_pixelpipe_init_cached(pipe, sizeof(float) * 4 * width * height, DT_PIPECACHE_MIN, 0);
   pipe->type = DT_DEV_PIXELPIPE_THUMBNAIL;
   return res;
 }
@@ -244,7 +242,7 @@ gboolean dt_dev_pixelpipe_init_dummy(dt_dev_pixelpipe_t *pipe,
 gboolean dt_dev_pixelpipe_init_preview(dt_dev_pixelpipe_t *pipe)
 {
   const gboolean res =
-    dt_dev_pixelpipe_init_cached(pipe, 0, darktable.pipe_cache ? 12 : DT_PIPECACHE_MIN, 0);
+    dt_dev_pixelpipe_init_cached(pipe, 0, darktable.pipe_cache ? 12 : DT_PIPECACHE_MIN, 32);
   pipe->type = DT_DEV_PIXELPIPE_PREVIEW;
   pipe->average_delay = DT_DEV_PREVIEW_AVERAGE_DELAY_START;
   return res;
@@ -253,7 +251,7 @@ gboolean dt_dev_pixelpipe_init_preview(dt_dev_pixelpipe_t *pipe)
 gboolean dt_dev_pixelpipe_init_preview2(dt_dev_pixelpipe_t *pipe)
 {
   const gboolean res =
-    dt_dev_pixelpipe_init_cached(pipe, 0, darktable.pipe_cache ? 5 : DT_PIPECACHE_MIN, 0);
+    dt_dev_pixelpipe_init_cached(pipe, 0, darktable.pipe_cache ? 5 : DT_PIPECACHE_MIN, 32);
   pipe->type = DT_DEV_PIXELPIPE_PREVIEW2;
   pipe->average_delay = DT_DEV_PREVIEW_AVERAGE_DELAY_START;
   return res;
@@ -261,10 +259,8 @@ gboolean dt_dev_pixelpipe_init_preview2(dt_dev_pixelpipe_t *pipe)
 
 gboolean dt_dev_pixelpipe_init(dt_dev_pixelpipe_t *pipe)
 {
-  const size_t csize = MAX(64*1024*1024, darktable.dtresources.mipmap_memory / 4);
   const gboolean res =
-    dt_dev_pixelpipe_init_cached(pipe, 0, darktable.pipe_cache ? 64 : DT_PIPECACHE_MIN,
-                                 csize);
+    dt_dev_pixelpipe_init_cached(pipe, 0, darktable.pipe_cache ? 64 : DT_PIPECACHE_MIN, 8);
   pipe->type = DT_DEV_PIXELPIPE_FULL;
   return res;
 }
@@ -272,7 +268,7 @@ gboolean dt_dev_pixelpipe_init(dt_dev_pixelpipe_t *pipe)
 gboolean dt_dev_pixelpipe_init_cached(dt_dev_pixelpipe_t *pipe,
                                       const size_t size,
                                       const int32_t entries,
-                                      const size_t memlimit)
+                                      const int32_t fraction)
 {
   pipe->devid = DT_DEVICE_CPU;
   pipe->loading = FALSE;
@@ -318,7 +314,7 @@ gboolean dt_dev_pixelpipe_init_cached(dt_dev_pixelpipe_t *pipe,
   pipe->bcache_hash = DT_INVALID_HASH;
   memset(pipe->mask_distort_buf, 0, sizeof(pipe->mask_distort_buf));
   memset(pipe->mask_distort_buf_size, 0, sizeof(pipe->mask_distort_buf_size));
-  return dt_dev_pixelpipe_cache_init(pipe, entries, size, memlimit);
+  return dt_dev_pixelpipe_cache_init(pipe, entries, size, fraction);
 }
 
 static inline size_t _dev_used_cachemem(void)
@@ -1386,13 +1382,15 @@ static inline dt_dev_pixelpipe_stopper_t _module_pipe_stop(dt_dev_pixelpipe_t *p
   const dt_dev_pixelpipe_stopper_t stopper = dt_atomic_get_int(&pipe->shutdown);
 
   if(stopper <= DT_DEV_PIXELPIPE_PROCESSING)
-    return DT_DEV_PIXELPIPE_STOP_NO;    // as being zero we can do simple if()
+    return DT_DEV_PIXELPIPE_STOP_NO;
 
   /** Ignore some UI shutdown requests
       As every shutdown request is restarting the pipe it's better to ignore them
       by resetting shutdown to DT_DEV_PIXELPIPE_PROCESSING if
       - we do mask visualizing or are in fast pipe mode
-      - we are very late in the pipe
+      - we are very late in the pipe using "colorout" as reference
+      - we received DT_DEV_PIXELPIPE_STOP_DATA very early while pipe processing,
+        this happes when dragging a slider on systems without fast OpenCL graphics
   */
   const gboolean simple =
            stopper == DT_DEV_PIXELPIPE_STOP_NODES
@@ -1407,12 +1405,18 @@ static inline dt_dev_pixelpipe_stopper_t _module_pipe_stop(dt_dev_pixelpipe_t *p
   const gboolean ignore_visual = (stopper == DT_DEV_PIXELPIPE_STOP_ZOOM || stopper == DT_DEV_PIXELPIPE_STOP_DATA)
                               && (dt_pipe_mask_display(pipe) || dt_pipe_is_fast(pipe));
 
-  if(ignore_late || ignore_visual)
+  const gboolean ignore_early = stopper == DT_DEV_PIXELPIPE_STOP_DATA
+                              && darktable.develop->history_last_module
+                              && darktable.develop->history_last_module->iop_order > module->iop_order;
+
+  if(ignore_late || ignore_visual || ignore_early)
   {
-    dt_print_pipe(DT_DEBUG_PIPE, "ignore shutdown", pipe, module, pipe->devid, NULL, NULL,"%s because of %s%s",
+    dt_print_pipe(DT_DEBUG_PIPE, "ignore shutdown", pipe, module, pipe->devid, NULL, NULL,"%s because of %s%s%s%s",
         dt_dev_pixelpipe_shutdown_to_str(stopper),
+        ignore_early ? "early " : "",
         ignore_late ? "late " : "",
-        ignore_late ? module->op : dt_pipe_mask_display(pipe) ? "mask visual" : "fast pipe");
+        ignore_visual && dt_pipe_is_fast(pipe) ? "fast pipe " : "",
+        ignore_visual && dt_pipe_mask_display(pipe) ? "mask visual" : "");
     dt_atomic_set_int(&pipe->shutdown, DT_DEV_PIXELPIPE_PROCESSING);
     return DT_DEV_PIXELPIPE_STOP_NO;
   }
@@ -2361,7 +2365,7 @@ static gboolean _dev_pixelpipe_process_rec(dt_dev_pixelpipe_t *pipe,
 
     const dt_opencl_tilemode_t fitter =
       dt_opencl_image_fits_device(pipe->devid, m_width, m_height,
-                                  m_bpp, tiling.factor_cl, tiling.overhead, tiling.overlap);
+                                  in_bpp, bpp, tiling.factor_cl, tiling.overhead, tiling.overlap);
 
     const gboolean no_tiling = fitter == DT_OPENCL_NO_TILING;
     const gboolean fast_tiling = fitter == DT_OPENCL_FAST_TILING
@@ -2554,7 +2558,7 @@ static gboolean _dev_pixelpipe_process_rec(dt_dev_pixelpipe_t *pipe,
             if(*cl_mem_output && no_tiling)
               err = module->process_cl(module, piece, cl_mem_input, *cl_mem_output, &roi_in, roi_out);
             else if(*cl_mem_output && fast_tiling)
-              err = process_tiling_cl_fast(piece, cl_mem_input, *cl_mem_output, &roi_in, roi_out, in_bpp, bpp, &tiling);
+              err = process_tiling_cl_fast(piece, cl_mem_input, *cl_mem_output, &roi_in, in_bpp, bpp, &tiling);
             else
               err = CL_MEM_OBJECT_ALLOCATION_FAILURE;
 
@@ -3261,7 +3265,7 @@ gboolean dt_dev_pixelpipe_process(dt_dev_pixelpipe_t *pipe,
     : DT_DEVICE_CPU;
 
   if(!claimed)  // don't free cachelines as the caller is using them
-    dt_dev_pixelpipe_cache_checkmem(pipe);
+    dt_dev_pixelpipe_cache_checkmem(pipe, FALSE);
 
   if(pipe->devid > DT_DEVICE_CPU) dt_opencl_events_reset(pipe->devid);
 

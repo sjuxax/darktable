@@ -534,17 +534,20 @@ static void _popup_scroll_cb(GtkEventControllerScroll *controller,
   if(w->type == DT_BAUHAUS_COMBOBOX)
   {
     // match keyboard: right & down -> next
-    int delta_x = 0, delta_y = 0;
-    dt_gui_get_scroll_unit_deltas_fallback(dx, dy, &delta_x, &delta_y);
-    const int delta = abs(delta_x) > abs(delta_y) ? delta_x : delta_y;
+    // the DISCRETE scroll proxy already accumulated smooth deltas into unit
+    // steps, so dx/dy are integer steps here.
+    const int delta = fabs(dx) > fabs(dy) ? (int)dx : (int)dy;
     if(delta != 0)
       _combobox_next_sensitive(w, delta, 0, w->combobox.mute_scrolling);
   }
   else
   {
-    int delta = 0;
-    dt_gui_get_scroll_unit_delta_fallback(dy, &delta);
-    _slider_zoom_range(w, delta);
+    // only zoom the range on a real scroll step: delta == 0 means no unit
+    // was accumulated yet and must NOT trigger the "reset zoom range"
+    // branch of _slider_zoom_range() (the middle-click action).
+    const int delta = (int)dy;
+    if(delta != 0)
+      _slider_zoom_range(w, delta);
   }
 }
 
@@ -1614,46 +1617,6 @@ static float _curve_log10(const float inval,
   else
     return (expf(M_LN10 * inval * 3.0f) - 1.0f) / 999.0f;
 }
-
-GtkWidget *dt_bauhaus_slider_new(dt_iop_module_t *self)
-{
-  return dt_bauhaus_slider_new_with_range(self, 0.0, 1.0, 0.1, 0.5, 3);
-}
-
-GtkWidget *dt_bauhaus_slider_new_with_range(dt_iop_module_t *self,
-                                            const float min,
-                                            const float max,
-                                            const float step,
-                                            const float defval,
-                                            const int digits)
-{
-  return dt_bauhaus_slider_new_with_range_and_feedback
-    (self, min, max, step, defval, digits, 1);
-}
-
-GtkWidget *dt_bauhaus_slider_new_action(dt_action_t *self,
-                                        const float min,
-                                        const float max,
-                                        const float step,
-                                        const float defval,
-                                        const int digits)
-{
-  return dt_bauhaus_slider_new_with_range((dt_iop_module_t *)self,
-                                          min, max, step, defval, digits);
-}
-
-GtkWidget *dt_bauhaus_slider_new_with_range_and_feedback(dt_iop_module_t *self,
-                                                         const float min,
-                                                         const float max,
-                                                         const float step,
-                                                         const float defval,
-                                                         const int digits,
-                                                         const int feedback)
-{
-  dt_bauhaus_widget_t *w = DT_BAUHAUS_WIDGET(g_object_new(DT_BAUHAUS_WIDGET_TYPE, NULL));
-  return dt_bauhaus_slider_from_widget(w, self, min, max, step, defval, digits, feedback);
-}
-
 
 GtkWidget *dt_bauhaus_slider_from_widget(dt_bauhaus_widget_t* w,
                                          dt_iop_module_t *self,
@@ -2885,8 +2848,7 @@ static gboolean _popup_draw(GtkWidget *widget,
     // make extra large, but without dependency on popup window height
     // (that might differ for comboboxes for example). only fall back
     // to height dependency if the popup is really small.
-    PangoFontDescription *desc =
-      pango_font_description_copy_static(bh->pango_font_desc);
+    PangoFontDescription *desc = dt_gui_get_font();
     pango_font_description_set_absolute_size(desc, size * PANGO_SCALE);
     pango_layout_set_font_description(layout, desc);
 
@@ -3369,6 +3331,27 @@ static void _popup_show(GtkWidget *widget)
   _window_position(0);
   gtk_widget_show_all(pop->window);
   gtk_widget_grab_focus(pop->area);
+}
+
+/** open the value-entry popup of a bauhaus widget, as if it were right-clicked.
+ *  GTK4: gtk_get_current_event() is gone; when porting, read the time from
+ *  the gesture's last event instead (gtk_gesture_get_last_event()). */
+void dt_bauhaus_widget_show_popup(GtkWidget *widget)
+{
+  dt_bauhaus_widget_t *w = DT_BAUHAUS_WIDGET(widget);
+  dt_bauhaus_t *bh = darktable.bauhaus;
+
+  if(w->type == DT_BAUHAUS_TOGGLE) return;
+
+  GdkEvent *event = gtk_get_current_event();
+  if(event)
+  {
+    bh->opentime = gdk_event_get_time(event);
+    gdk_event_free(event);
+  }
+  bh->mouse_x = 0;
+  bh->mouse_y = 0;
+  _popup_show(widget);
 }
 
 static void _slider_add_step(GtkWidget *widget,
@@ -3977,8 +3960,11 @@ static void _widget_button_press(GtkGestureSingle *gesture,
   else if(button == GDK_BUTTON_SECONDARY || w->type == DT_BAUHAUS_COMBOBOX)
   {
     GdkEvent *const event = gtk_get_current_event();
-    bh->opentime = gdk_event_get_time(event);
-    gdk_event_free(event);
+    if(event)
+    {
+      bh->opentime = gdk_event_get_time(event);
+      gdk_event_free(event);
+    }
     bh->mouse_x = x;
     bh->mouse_y = y;
     _popup_show(widget);
@@ -4069,10 +4055,14 @@ static void _widget_motion(GtkEventControllerMotion *controller,
       const float scaled_step =
         width * dt_bauhaus_slider_get_step(widget) / (d->max - d->min);
       const float steps = floorf((x - bh->mouse_x) / scaled_step);
-      GdkEvent *const event = gtk_get_current_event(); // TODO cleanup
+      // the current event may be NULL for synthetic motions; fall back to
+      // the global keyboard state in that case
+      GdkEvent *const event = gtk_get_current_event();
+      const GdkModifierType motion_state = event ? dt_gdk_event_get_state(event)
+                                                 : dt_key_modifier_state();
+      if(event) gdk_event_free(event);
       _slider_add_step(widget, copysignf(1, d->factor) * steps,
-                       dt_gdk_event_get_state(event), FALSE);
-      gdk_event_free(event);
+                       motion_state, FALSE);
 
       bh->mouse_x += steps * scaled_step;
     }

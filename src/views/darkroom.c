@@ -882,8 +882,7 @@ void expose(dt_view_t *self,
       // waiting message
       PangoRectangle ink;
       PangoLayout *layout;
-      PangoFontDescription *desc =
-        pango_font_description_copy_static(darktable.bauhaus->pango_font_desc);
+      PangoFontDescription *desc = dt_gui_get_font();
       pango_font_description_set_absolute_size(desc, fontsize * PANGO_SCALE);
       pango_font_description_set_weight(desc, PANGO_WEIGHT_BOLD);
       layout = pango_cairo_create_layout(cri);
@@ -1129,8 +1128,7 @@ void expose(dt_view_t *self,
     cairo_set_source_rgba(cri, 0.5, 0.5, 0.5, 0.5);
     PangoLayout *layout;
     PangoRectangle ink;
-    PangoFontDescription *desc =
-      pango_font_description_copy_static(darktable.bauhaus->pango_font_desc);
+    PangoFontDescription *desc = dt_gui_get_font();
     pango_font_description_set_weight(desc, PANGO_WEIGHT_BOLD);
     layout = pango_cairo_create_layout(cri);
     pango_font_description_set_absolute_size(desc, DT_PIXEL_APPLY_DPI(20) * PANGO_SCALE);
@@ -4034,8 +4032,7 @@ void enter(dt_view_t *self)
 
 static inline void _clear_pipecache(dt_dev_pixelpipe_t *pipe)
 {
-  // As log as we don't have a better trim ...
-  dt_dev_pixelpipe_cache_checkmem(pipe);
+  dt_dev_pixelpipe_cache_checkmem(pipe, TRUE);
 
   if(pipe->bcache_data)
   {
@@ -5069,40 +5066,52 @@ static void _second_window_scrolled_callback(GtkEventControllerScroll *controlle
 
   dt_dev_viewport_t *port = pinned_dev ? &pinned_dev->preview2 : &dev->preview2;
 
-  const GdkEvent *current = gtk_get_current_event();
+  GdkEvent *current = gtk_get_current_event();
   if(!current) return;
 
   GdkModifierType state;
   gtk_get_current_event_state(&state);
 
-  // Two-finger trackpad scroll pans the image, like the main darkroom view's
-  // _scrolled()/gesture_pan path.  The mouse wheel zooms.  Ctrl forces zoom
-  // even for smooth scrolls.
-  if(dt_gdk_event_get_scroll_direction(current) == GDK_SCROLL_SMOOTH
-     && !dt_modifier_is(state, GDK_CONTROL_MASK))
+  // A touchpad two-finger swipe pans the image, like the main darkroom view's
+  // _scrolled()/gesture_pan path.  dt_gui_scroll_should_pan() restricts this to
+  // touchpad-sourced events, so the mouse wheel zooms even where GTK delivers
+  // wheel scrolls as smooth events.
+  if(dt_gui_scroll_should_pan((const GdkEventScroll *)current))
   {
     const GdkEventScroll *scroll = (const GdkEventScroll *)current;
     gdouble pan_dx = 0.0, pan_dy = 0.0;
-    if(!dt_gui_get_scroll_deltas(scroll, &pan_dx, &pan_dy)) return;
+    if(!dt_gui_get_scroll_deltas(scroll, &pan_dx, &pan_dy))
+    {
+      gdk_event_free(current);
+      return;
+    }
     pan_dx *= DT_UI_SCROLL_SMOOTH_DELTA_SCALE;
     pan_dy *= DT_UI_SCROLL_SMOOTH_DELTA_SCALE;
     dt_print(DT_DEBUG_INPUT,
              "[darkroom second window] pan dx=%.3f dy=%.3f", pan_dx, pan_dy);
     if(pan_dx != 0.0 || pan_dy != 0.0)
       dt_dev_zoom_move(port, DT_ZOOM_MOVE, 1.0f, 0, pan_dx, pan_dy, TRUE);
+    gdk_event_free(current);
     return;
   }
 
-  int delta_y;
-  if(!dt_gui_get_scroll_unit_delta((const GdkEventScroll *)current, &delta_y)) return;
+  int delta_x, delta_y;
+  if(!dt_gui_get_scroll_unit_deltas((const GdkEventScroll *)current, &delta_x, &delta_y))
+  {
+    gdk_event_free(current);
+    return;
+  }
+  const gboolean zoom_in = dt_gui_scroll_zoom_delta((const GdkEventScroll *)current,
+                                                    delta_x, delta_y) > 0.0f;
   const gboolean constrained =
     dev->constrain_zoom && !dt_modifier_is(state, GDK_CONTROL_MASK);
   gdouble x = 0.0, y = 0.0;
   gdk_event_get_coords(current, &x, &y);
   dt_print(DT_DEBUG_INPUT,
-           "[darkroom second window] scroll zoom delta_y=%d", delta_y);
-  dt_dev_zoom_move(port, DT_ZOOM_SCROLL, 0.0f, delta_y < 0 ? 1 : 0,
+           "[darkroom second window] scroll zoom zoom_in=%d", zoom_in);
+  dt_dev_zoom_move(port, DT_ZOOM_SCROLL, 0.0f, zoom_in ? 1 : 0,
                    x, y, constrained);
+  gdk_event_free(current);
 }
 
 static gboolean _second_window_pinch_callback(GtkWidget *widget,

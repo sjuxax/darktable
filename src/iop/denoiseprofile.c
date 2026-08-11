@@ -3398,8 +3398,7 @@ static gboolean denoiseprofile_draw(GtkWidget *widget,
   // draw labels:
   PangoLayout *layout;
   PangoRectangle ink;
-  PangoFontDescription *desc =
-    pango_font_description_copy_static(darktable.bauhaus->pango_font_desc);
+  PangoFontDescription *desc = dt_gui_get_font();
   pango_font_description_set_weight(desc, PANGO_WEIGHT_BOLD);
   pango_font_description_set_absolute_size(desc, (.08 * height) * PANGO_SCALE);
   layout = pango_cairo_create_layout(cr);
@@ -3543,6 +3542,22 @@ static void denoiseprofile_scrolled(GtkEventControllerScroll *controller,
                                      dt_iop_module_t *self)
 {
   dt_iop_denoiseprofile_gui_data_t *g = self->gui_data;
+
+  if(dt_modifier_eq(controller, GDK_MOD1_MASK))
+  {
+    // alt+scroll switches the channel tab (as before the controller conversion)
+    // GTK4: no gtk_widget_event() -- reimplement as a controller on the notebook
+    GdkEvent *event = gtk_get_current_event();
+    if(event)
+    {
+      gtk_widget_event(GTK_WIDGET(g->channel > DT_DENOISE_PROFILE_B
+                                  ? g->channel_tabs_Y0U0V0
+                                  : g->channel_tabs),
+                       event);
+      gdk_event_free(event);
+    }
+    return;
+  }
 
   if(dy != 0.0)
   {
