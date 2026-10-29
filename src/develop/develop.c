@@ -50,7 +50,12 @@
 #include "lua/call.h"
 #endif
 
-#define DT_DEV_AVERAGE_DELAY_COUNT 5
+/** The averaged time for a pipe run is calculated over DT_DEV_AVERAGE_DELAY_COUNT
+    runs and is kept in pipe->average_delay (microseconds)
+    With improved pipe caching this got bumped from 5 to 8 reducing effect of very
+    fast runs while editing.
+*/
+#define DT_DEV_AVERAGE_DELAY_COUNT 8
 
 // Margins (as a fraction of the image size) by which the editable "canvas" may
 // extend beyond the image while working on a mask, so off-image content can be
@@ -73,10 +78,7 @@ void dt_dev_init(dt_develop_t *dev,
   dev->gui_leaving = FALSE;
   dev->gui_synch = FALSE;
 
-  pthread_mutexattr_t recursive_locking;
-  pthread_mutexattr_init(&recursive_locking);
-  pthread_mutexattr_settype(&recursive_locking, PTHREAD_MUTEX_RECURSIVE);
-  dt_pthread_mutex_init(&dev->history_mutex, &recursive_locking);
+  dt_pthread_recursive_mutex_init(&dev->history_mutex);
 
   dev->snapshot_id = -1;
   dev->history_end = 0;
@@ -254,7 +256,6 @@ void dt_dev_cleanup(dt_develop_t *dev)
   dev->histogram_pre_tonecurve = dev->histogram_pre_levels = NULL;
 
   // Clean up pinned develop
-  // Clean up pinned develop
   if(dev->preview2_pinned_dev)
   {
     _cleanup_pinned_dev(dev->preview2_pinned_dev);
@@ -280,11 +281,29 @@ void dt_dev_cleanup(dt_develop_t *dev)
   g_list_free(dev->module_filter_out);
 }
 
+/** How do we handle UI responsiveness for pipes getting a changed parameter?
+    1. We know from pixelpipe started_time when last piperun started
+    2. For fast UI visualizing of processed pipe data we don't shutdown a running
+       pipe if the timespan from last start is less than half of averaged pipe runtime.
+       This possibly avoids superfluous piperuns thus less cache pressure.
+    3. Otherwise it's worth to do a shutdown to avoid further processing.
+*/
+static inline gboolean _inside_pipe_ui_frame(const dt_dev_pixelpipe_t *pipe)
+{
+  const gint64 elapsed = g_get_monotonic_time() - pipe->started_time;
+  return elapsed < pipe->average_delay/2;
+}
+
 void dt_dev_process_image(dt_develop_t *dev)
 {
   if(!dev->gui_attached) return;
   if(dt_pipe_processing(dev->full.pipe))
-    dt_dev_pixelpipe_set_shutdown(dev->full.pipe, DT_DEV_PIXELPIPE_STOP_DATA);
+  {
+    if(_inside_pipe_ui_frame(dev->full.pipe))
+      return;
+    else
+      dt_dev_pixelpipe_set_shutdown(dev->full.pipe, DT_DEV_PIXELPIPE_STOP_DATA);
+  }
 
   const gboolean err = dt_control_add_job_res(dt_dev_process_image_job_create(dev), DT_CTL_WORKER_ZOOM_1);
   if(err) dt_print(DT_DEBUG_ALWAYS, "[dev_process_image] job queue exceeded!");
@@ -301,7 +320,12 @@ void dt_dev_process_preview2(dt_develop_t *dev)
 {
   if(!dev->gui_attached && !dev->preview2.widget) return;
   if(dt_pipe_processing(dev->preview2.pipe))
-    dt_dev_pixelpipe_set_shutdown(dev->preview2.pipe, DT_DEV_PIXELPIPE_STOP_DATA);
+  {
+    if(_inside_pipe_ui_frame(dev->preview2.pipe))
+      return;
+    else
+      dt_dev_pixelpipe_set_shutdown(dev->preview2.pipe, DT_DEV_PIXELPIPE_STOP_DATA);
+  }
   const gboolean err = dt_control_add_job_res(dt_dev_process_preview2_job_create(dev), DT_CTL_WORKER_ZOOM_2);
   if(err) dt_print(DT_DEBUG_ALWAYS, "[dev_process_preview2] job queue exceeded!");
 }
@@ -598,15 +622,47 @@ void dt_dev_invalidate_preview(dt_develop_t *dev)
     dev->preview2.pipe->input_timestamp = dev->timestamp;
 }
 
-static void _dev_average_delay_update(const dt_times_t *start,
-                                      uint32_t *average_delay)
+static void _dev_average_delay_update(gint64 elapsed,
+                                      gint64 *average_delay)
 {
-  dt_times_t end;
-  dt_get_times(&end);
-
-  *average_delay += ((end.clock - start->clock) * 1000 / DT_DEV_AVERAGE_DELAY_COUNT
-                     - *average_delay / DT_DEV_AVERAGE_DELAY_COUNT);
+  *average_delay += elapsed / DT_DEV_AVERAGE_DELAY_COUNT
+                     - *average_delay / DT_DEV_AVERAGE_DELAY_COUNT;
 }
+
+void dt_dev_pixelpipe_stop_and_lock_all(dt_develop_t *dev)
+  ACQUIRE(&dev->preview_pipe->mutex, &dev->preview2.pipe->mutex, &dev->full.pipe->mutex)
+{
+  assert(dev && dev->preview_pipe && dev->preview2.pipe && dev->full.pipe);
+
+  dt_dev_pixelpipe_set_shutdown(dev->preview_pipe, DT_DEV_PIXELPIPE_STOP_NODES);
+  dt_dev_pixelpipe_set_shutdown(dev->preview2.pipe, DT_DEV_PIXELPIPE_STOP_NODES);
+  dt_dev_pixelpipe_set_shutdown(dev->full.pipe, DT_DEV_PIXELPIPE_STOP_NODES);
+
+  // Canonical all-screen-pipe lock order. Workers hold at most one pipe mutex,
+  // then may take history_mutex while synchronizing nodes.
+  dt_pthread_mutex_lock(&dev->preview_pipe->mutex);
+  dt_pthread_mutex_lock(&dev->preview2.pipe->mutex);
+  dt_pthread_mutex_lock(&dev->full.pipe->mutex);
+}
+
+void dt_dev_pixelpipe_unlock_all(dt_develop_t *dev)
+  RELEASE(&dev->preview_pipe->mutex, &dev->preview2.pipe->mutex, &dev->full.pipe->mutex)
+{
+  assert(dev && dev->preview_pipe && dev->preview2.pipe && dev->full.pipe);
+
+  dt_pthread_mutex_unlock(&dev->full.pipe->mutex);
+  dt_pthread_mutex_unlock(&dev->preview2.pipe->mutex);
+  dt_pthread_mutex_unlock(&dev->preview_pipe->mutex);
+}
+
+static void _dev_zoom_move(dt_dev_viewport_t *port,
+                           dt_dev_zoom_t zoom,
+                           float scale,
+                           int closeup,
+                           const float x,
+                           const float y,
+                           const gboolean constrain,
+                           const gboolean use_mask_overlay);
 
 void dt_dev_process_image_job(dt_develop_t *dev,
                               dt_dev_viewport_t *port,
@@ -756,18 +812,56 @@ restart:
 
   if(port)
   {
+    // A displayed mask overlay enlarges the pannable canvas so handles lying
+    // outside the picture can be reached (see _clamp_zoom_to_mask), but the
+    // worker must not walk form_gui's mutable point arrays to learn by how
+    // much. Re-validating without them takes that allowance away: every mask
+    // edit dirties the pipe, so releasing a node dragged past the image edge
+    // sprang the view back to the picture. The GUI clamps with the overlay
+    // bounds on the next pan or zoom, and dt_masks_set_edit_mode() re-validates
+    // when the overlay goes away, so nothing stays stranded off-canvas.
+    // An image switch (port_loading) still validates: the overlay belongs to
+    // the image being left, and the pan must land inside the new one.
+    const gboolean mask_overlay_shown =
+      port == &dev->full && dev->form_visible && dev->form_gui;
+
     /* if just changed to an image with a different aspect ratio or
         altered image orientation, the prior zoom xy could now be beyond
         the image boundary.
         dt_dev_zoom_move() possibly leaves port->pipe->changed DT_DEV_PIPE_ZOOMED;
         and might redraw the widgets as a side effect
     */
-    if(port_loading || require_zoom_test)
+    if(port->restore_zoom && port_loading && pipe->processed_width && pipe->processed_height)
+    {
+      /* An image switch just happened. port->zoom_x/zoom_y are in input pixel
+         coordinates of the *previous* image, so reprojecting them through this
+         image's geometry modules would drop the viewport at an arbitrary spot
+         (typically an edge or corner once clamped). Re-apply the normalised
+         centre snapshotted before the switch instead.
+      */
+      const float rx = port->restore_zoom_x;
+      const float ry = port->restore_zoom_y;
+      port->restore_zoom = FALSE;
+      dt_print_pipe(DT_DEBUG_PIPE,
+                    "dt_dev_zoom_move",
+                    pipe,
+                    NULL,
+                    DT_DEVICE_NONE,
+                    NULL,
+                    NULL,
+                    "restore centre %.4f/%.4f",
+                    rx,
+                    ry);
+      // Worker validation must not traverse GUI-owned mask overlay arrays.
+      _dev_zoom_move(port, DT_ZOOM_POSITION, 0.0f, 0, rx, ry, TRUE, FALSE);
+    }
+    else if(port_loading || (require_zoom_test && !mask_overlay_shown))
     {
       dt_print_pipe(DT_DEBUG_PIPE, "dt_dev_zoom_move", pipe, NULL, DT_DEVICE_NONE, NULL, NULL, "%s%s",
         port_loading ? "port_loading " : "",
         require_zoom_test ? "required_test" : "");
-      dt_dev_zoom_move(port, DT_ZOOM_MOVE, 0.0f, 0, 0.0f, 0.0f, TRUE);
+      // Clamp to image geometry only; mask overlays are mutable GUI state.
+      _dev_zoom_move(port, DT_ZOOM_MOVE, 0.0f, 0, 0.0f, 0.0f, TRUE, FALSE);
     }
 
     // determine scale according to current dimensions
@@ -788,8 +882,8 @@ restart:
   const int x = port ? CLAMP(pipe_width  * (.5 + zoom_x) - wd / 2, 0, pipe_width  - wd) : 0;
   const int y = port ? CLAMP(pipe_height * (.5 + zoom_y) - ht / 2, 0, pipe_height - ht) : 0;
 
-  dt_get_times(&start);
-
+  dt_get_perf_times(&start);
+  pipe->started_time = g_get_monotonic_time();
   const gboolean early = dt_dev_pixelpipe_process(pipe, dev, x, y, wd, ht, scale, devid);
   const dt_dev_pixelpipe_stopper_t shutdown = dt_atomic_exch_int(&pipe->shutdown, DT_DEV_PIXELPIPE_STOP_NO);
   const gboolean stopped = early || shutdown > DT_DEV_PIXELPIPE_PROCESSING;
@@ -862,11 +956,16 @@ restart:
     }
   }
 
-  dt_print_pipe(DT_DEBUG_PIPE, "process_image_job done", pipe, NULL, DT_DEVICE_NONE, &proi, NULL, "\n");
   dt_show_times_f(&start,
                   "[dev_process_image] pixel pipeline", "processing `%s'",
                   dev->image_storage.filename);
-  _dev_average_delay_update(&start, &pipe->average_delay);
+
+  const gint64 elapsed = MAX(0, g_get_monotonic_time() - pipe->started_time);
+  _dev_average_delay_update(elapsed, &pipe->average_delay);
+
+  dt_print_pipe(DT_DEBUG_PIPE, "process_image_job done",
+    pipe, NULL, DT_DEVICE_NONE, &proi, NULL, "took %dms, average=%dms\n",
+    (int)elapsed / 1000, (int)pipe->average_delay / 1000);
 
   pipe->status = DT_DEV_PIXELPIPE_VALID;
   pipe->loading = FALSE;
@@ -956,8 +1055,10 @@ float dt_dev_get_zoom_scale(dt_dev_viewport_t *port,
 {
   float zoom_scale = .0f;
 
-  int procw, proch;
+  int procw = 0, proch = 0;
   dt_dev_get_processed_size(port, &procw, &proch);
+
+  if(procw <= 0 || proch <= 0) return 1.0f;
 
   const float w = (float)port->width / procw;
   const float h = (float)port->height / proch;
@@ -1049,7 +1150,9 @@ void dt_dev_configure(dt_dev_viewport_t *port)
   }
 
   port->border_size = tb;
-  // fixed border on every side
+  // fixed border on every side. Not reduced by occlusion_left/right, so that
+  // showing or hiding an overlay never moves the image: the pan clamp
+  // (_clamp_zoom_to_mask) keeps the covered strip reachable instead
   const int32_t wd = port->orig_width - 2*tb;
   const int32_t ht = port->orig_height - 2*tb;
   if(port->width != wd || port->height != ht)
@@ -1059,6 +1162,20 @@ void dt_dev_configure(dt_dev_viewport_t *port)
     port->pipe->changed |= DT_DEV_PIPE_ZOOMED;
     dt_dev_zoom_move(port, DT_ZOOM_MOVE, 0.0f, 1, 0.0f, 0.0f, TRUE);
   }
+}
+
+void dt_dev_set_occlusion(dt_dev_viewport_t *port,
+                          const int32_t left,
+                          const int32_t right)
+{
+  if(!port) return;
+
+  port->occlusion_left = left;
+  port->occlusion_right = right;
+  // the allowance grows at once, as the covered strip must be reachable now;
+  // the clamp shrinks it (see occlusion_hold_left). The layout stays as it is
+  port->occlusion_hold_left = MAX(port->occlusion_hold_left, left);
+  port->occlusion_hold_right = MAX(port->occlusion_hold_right, right);
 }
 
 // helper used to synch a single history item with db
@@ -1393,6 +1510,9 @@ static void _dev_add_history_item(dt_develop_t *dev,
 {
   if(!darktable.gui || DT_IN_GUI_UPDATE()) return;
 
+  // check if newly enabled for later visiblity updates
+  const gboolean new_enabled = enable && !module->enabled;
+
   // record current name, needed to ensure we do an undo record
   // if the module name is changed.
 
@@ -1439,6 +1559,9 @@ static void _dev_add_history_item(dt_develop_t *dev,
 
   if(dev->gui_attached)
   {
+    if(new_enabled && dt_dev_modulegroups_get_activated(module->dev) == DT_MODULEGROUP_ACTIVE_PIPE)
+      dt_dev_modulegroups_update_visibility(dev);
+
     /* signal that history has changed */
     if(tag_change)
       DT_CONTROL_SIGNAL_RAISE(DT_SIGNAL_TAG_CHANGED);
@@ -1516,6 +1639,14 @@ void dt_dev_add_masks_history_item(dt_develop_t *dev,
     dt_masks_point_group_t *fpt = g_list_nth_data(form->points, gui->group_edited);
     if(fpt) target = GINT_TO_POINTER(fpt->formid);
   }
+
+  // editing a mask, in the panel or on the canvas, switches the mask on, as
+  // `enable` switches the module on: the panel's controls stay live with the
+  // mask off. Replay, undo, style apply and history copy call
+  // dt_dev_add_masks_history_item_ext() directly. Before the lock: enabling
+  // commits a history item of its own, which takes history_mutex
+  if(enable && dev->gui_attached)
+    dt_iop_gui_blend_mask_enable(module ? module : dev->gui_module);
 
   dt_pthread_mutex_lock(&dev->history_mutex);
 
@@ -1615,6 +1746,12 @@ void dt_dev_reload_history_items(dt_develop_t *dev)
   // set the module list order
   dt_dev_reorder_gui_module_list(dev);
 
+  // the forms were just replaced: the masks panel's empty-group placeholders,
+  // which exist in the GUI only, have no counterpart in them any more (see
+  // dt_iop_gui_blend_forms_reloaded)
+  for(GList *modules = dev->iop; modules; modules = g_list_next(modules))
+    dt_iop_gui_blend_forms_reloaded((dt_iop_module_t *)modules->data);
+
   dt_unlock_image(dev->image_storage.id);
 }
 
@@ -1632,6 +1769,11 @@ void dt_dev_pop_history_items_ext(dt_develop_t *dev, const int32_t cnt)
     memcpy(module->params, module->default_params, module->params_size);
     dt_iop_commit_blend_params(module, module->default_blendop_params, NULL);
     module->enabled = module->default_enabled;
+
+    // reset the instance name too: per-position state restored from
+    // history below, else a later rename would leak into earlier positions
+    module->multi_name_hand_edited = FALSE;
+    g_strlcpy(module->multi_name, "", sizeof(module->multi_name));
 
     if(module->multi_priority == 0)
       module->iop_order =
@@ -1691,6 +1833,57 @@ void dt_dev_pop_history_items_ext(dt_develop_t *dev, const int32_t cnt)
   }
   if(masks_changed)
     dt_masks_replace_current_forms(dev, forms);
+}
+
+// compress (or, with compress FALSE, truncate at history_end) the history
+// of the image being developed in darkroom
+void dt_dev_history_truncate(dt_develop_t *dev, const gboolean compress)
+{
+  const dt_imgid_t imgid = dev->image_storage.id;
+  if(!dt_is_valid_imgid(imgid)) return;
+
+  dt_dev_undo_start_record(dev);
+
+  // As dt_history_compress_on_image does *not* use the history stack data at all
+  // make sure the current stack is in the database
+  dt_dev_write_history(dev);
+
+  if(compress)
+    dt_history_compress_on_image(imgid);
+  else
+    dt_history_truncate_on_image(imgid, dev->history_end);
+
+  sqlite3_stmt *stmt;
+
+  // load new history and write it back to ensure that all history are
+  // properly numbered without a gap
+  dt_dev_reload_history_items(dev);
+  dt_dev_write_history(dev);
+  dt_image_synch_xmp(imgid);
+
+  // then we can get the item to select in the new clean-up history
+  // retrieve the position of the module corresponding to the history
+  // end.  clang-format off
+  DT_DEBUG_SQLITE3_PREPARE_V2(dt_database_get(darktable.db),
+                              "SELECT IFNULL(MAX(num)+1, 0)"
+                              " FROM main.history"
+                              " WHERE imgid=?1", -1, &stmt, NULL);
+  // clang-format on
+  DT_DEBUG_SQLITE3_BIND_INT(stmt, 1, imgid);
+
+  if(sqlite3_step(stmt) == SQLITE_ROW)
+    dev->history_end = sqlite3_column_int(stmt, 0);
+  sqlite3_finalize(stmt);
+
+  // select the new history end corresponding to the one before the history compression
+  dt_image_set_history_end(imgid, dev->history_end);
+
+  dt_dev_reload_history_items(dev);
+  dt_dev_undo_end_record(dev);
+
+  dt_dev_modulegroups_set(dev, dt_dev_modulegroups_get(dev));
+
+  DT_CONTROL_SIGNAL_RAISE(DT_SIGNAL_DEVELOP_HISTORY_INVALIDATED);
 }
 
 void dt_dev_pop_history_items(dt_develop_t *dev, const int32_t cnt)
@@ -1981,6 +2174,15 @@ static gboolean _dev_auto_apply_presets(dt_develop_t *dev)
 
   const gboolean auto_module = dt_conf_get_bool("darkroom/ui/auto_module_name_update");
 
+  // operations that must not auto-apply on this particular image
+  GString *skip_ops = g_string_new("");
+  if(!is_display_referred)
+    g_string_append(skip_ops, ", 'basecurve'");
+  // already denoised: the output keeps the source ISO, so an ISO-ranged
+  // denoise preset still matches it (issue #21391)
+  if(dt_image_is_ai_denoised(image))
+    g_string_append(skip_ops, ", 'denoiseprofile', 'rawdenoise'");
+
   snprintf(query, sizeof(query),
            "INSERT OR REPLACE INTO memory.history"
            " SELECT ?1, 0, op_version, operation AS op, op_params,"
@@ -2000,7 +2202,7 @@ static gboolean _dev_auto_apply_presets(dt_develop_t *dev)
            // skip non iop modules:
            "   AND operation NOT IN"
            "       ('ioporder', 'metadata', 'modulegroups', 'export',"
-           "        'tagging', 'collect', '%s')"
+           "        'tagging', 'collect'%s)"
            // select all user's auto presets or the hard-coded presets (for the workflow)
            // if non auto-presets for the same operation and matching
            // camera/lens/focal/format/exposure found.
@@ -2029,7 +2231,8 @@ static gboolean _dev_auto_apply_presets(dt_develop_t *dev)
                "  THEN multi_name"
                "  ELSE (ROW_NUMBER() OVER (PARTITION BY operation ORDER BY operation) - 1)"
                " END",
-           is_display_referred ? "" : "basecurve");
+           skip_ops->str);
+  g_string_free(skip_ops, TRUE);
   // clang-format on
 
   // query for all modules at once:
@@ -2250,20 +2453,20 @@ static void _dev_merge_history(dt_develop_t *dev,
       if(sqlite3_step(stmt) == SQLITE_DONE)
       {
         sqlite3_finalize(stmt);
-        // clang-format off
+
+        // the masks history rows go with the items they belong to: each row
+        // set is the forms snapshot of one history num
         DT_DEBUG_SQLITE3_PREPARE_V2(dt_database_get(darktable.db),
-                                    "UPDATE main.images"
-                                    " SET history_end=history_end+?1"
-                                    " WHERE id=?2",
+                                    "UPDATE main.masks_history SET num=num+?1 WHERE imgid=?2",
                                     -1, &stmt, NULL);
-        // clang-format on
         DT_DEBUG_SQLITE3_BIND_INT(stmt, 1, cnt);
         DT_DEBUG_SQLITE3_BIND_INT(stmt, 2, imgid);
+        sqlite3_step(stmt);
+        sqlite3_finalize(stmt);
 
-        if(sqlite3_step(stmt) == SQLITE_DONE)
+        if(dt_image_shift_history_end(imgid, cnt))
         {
           // and finally prepend the rest with increasing numbers (starting at 0)
-          sqlite3_finalize(stmt);
           // clang-format off
           DT_DEBUG_SQLITE3_PREPARE_V2(
             dt_database_get(darktable.db),
@@ -2361,9 +2564,18 @@ void dt_dev_read_history_ext(dt_develop_t *dev,
     dt_print(DT_DEBUG_PARAMS,
              "[dt_dev_read_history_ext] temporary history merged with image history");
 
-    //  first time we are loading the image, try to import lightroom .xmp if any
-    if(dev->full.pipe && dev->full.pipe->loading && first_run)
-      dt_lightroom_import(dev->image_storage.id, dev, TRUE);
+    //  if no foreign XMP has been applied and we are loading the image for the
+    //  first time, try to import lightroom .xmp if any.
+    if (dev->full.pipe && dev->full.pipe->loading)
+    {
+      dt_image_t *image = dt_image_cache_get(imgid, 'w');
+      if (!(image->flags & DT_IMAGE_FOREIGN_XMP_APPLIED))
+      {
+        dt_lightroom_import(dev->image_storage.id, dev, TRUE);
+        image->flags |= DT_IMAGE_FOREIGN_XMP_APPLIED;
+      }
+      dt_image_cache_write_release(image, DT_IMAGE_CACHE_RELAXED);
+    }
 
     // if a snapshot move all auto-presets into the history_snapshot table
 
@@ -2391,15 +2603,7 @@ void dt_dev_read_history_ext(dt_develop_t *dev,
   // Get the end of the history - What's that ???
 
   int history_end_current = 0;
-
-  DT_DEBUG_SQLITE3_PREPARE_V2(dt_database_get(darktable.db),
-                              "SELECT history_end FROM main.images WHERE id = ?1",
-                              -1, &stmt, NULL);
-  DT_DEBUG_SQLITE3_BIND_INT(stmt, 1, imgid);
-  if(sqlite3_step(stmt) == SQLITE_ROW) // seriously, this should never fail
-    if(sqlite3_column_type(stmt, 0) != SQLITE_NULL)
-      history_end_current = sqlite3_column_int(stmt, 0);
-  sqlite3_finalize(stmt);
+  dt_image_get_history_end(imgid, &history_end_current);
 
   // Load current image history from DB
   // clang-format off
@@ -2434,6 +2638,12 @@ void dt_dev_read_history_ext(dt_develop_t *dev,
   // clang-format on
 
   dev->history_end = 0;
+  // both migration queues are drained by the previous call; a stale entry
+  // would act on the previously loaded image
+  g_list_free_full(dev->pending_flexi_migrations, free);
+  dev->pending_flexi_migrations = NULL;
+  g_list_free(dev->pending_flexi_group_splits);
+  dev->pending_flexi_group_splits = NULL;
 
   // Specific handling for None workflow (interdependency)
 
@@ -2598,30 +2808,24 @@ void dt_dev_read_history_ext(dt_develop_t *dev,
       g_strlcpy(hist->multi_name, multi_name, sizeof(hist->multi_name));
     hist->params = malloc(hist->module->params_size);
     hist->blend_params = malloc(sizeof(dt_develop_blend_params_t));
+    memcpy(hist->params, hist->module->default_params, hist->module->params_size);
+    memcpy(hist->blend_params, hist->module->default_blendop_params,
+           sizeof(dt_develop_blend_params_t));
 
     // update module iop_order only on active history entries
     if(history_end_current > dev->history_end)
       hist->module->iop_order = hist->iop_order;
 
-    // Copy blending params if valid, else try to convert legacy params
-    if(blendop_params
-       && is_valid_blendop_version
-       && is_valid_blendop_size)
-    {
-      memcpy(hist->blend_params, blendop_params, sizeof(dt_develop_blend_params_t));
-    }
-    else if(blendop_params
-            && dt_develop_blend_legacy_params
-            (hist->module, blendop_params, blendop_version,
-             hist->blend_params, dt_develop_blend_version(), bl_length) == FALSE)
-    {
-      legacy_params = TRUE;
-    }
-    else
-    {
+    // the blend params, converted or migrated if need be, with any mask forms
+    // they carry (an auto-applied preset's) added under this row's num.
+    // Defaults if they cannot be read
+    gboolean blend_converted = FALSE;
+    if(dt_develop_blend_params_read(hist->module, blendop_params, bl_length, blendop_version,
+                                    hist->blend_params, num, FALSE, &blend_converted))
       memcpy(hist->blend_params, hist->module->default_blendop_params,
              sizeof(dt_develop_blend_params_t));
-    }
+    else if(blend_converted)
+      legacy_params = TRUE;
 
     // Copy module params if valid, else try to convert legacy params
     if(param_length == 0)
@@ -2632,6 +2836,22 @@ void dt_dev_read_history_ext(dt_develop_t *dev,
     else if(is_valid_module_version && is_valid_params_size && is_valid_module_name)
     {
       memcpy(hist->params, module_params, hist->module->params_size);
+    }
+    else if(modversion > hist->module->version())
+    {
+      //  We are loading a module created by another version of
+      //  Darktable and having a module's version greater and unknown
+      //  by this instance. There is no migration possible here to
+      //  recover properly. We just avoid a crash by using the default
+      //  parameters for the given module.
+      const char *fname =
+        dev->image_storage.filename + strlen(dev->image_storage.filename);
+      while(fname > dev->image_storage.filename && *fname != '/') fname--;
+      if(fname > dev->image_storage.filename) fname++;
+
+      dt_control_log(_("%s: module `%s' has unknown version %d, using default parameters"),
+                     fname, hist->module->op,
+                     modversion);
     }
     else
     {
@@ -2708,19 +2928,20 @@ void dt_dev_read_history_ext(dt_develop_t *dev,
   if(dev->snapshot_id == -1)
   {
     // find the new history end
-    DT_DEBUG_SQLITE3_PREPARE_V2(dt_database_get(darktable.db),
-                                "SELECT history_end FROM main.images WHERE id = ?1",
-                                -1, &stmt, NULL);
-    DT_DEBUG_SQLITE3_BIND_INT(stmt, 1, imgid);
-    if(sqlite3_step(stmt) == SQLITE_ROW) // seriously, this should never fail
-      if(sqlite3_column_type(stmt, 0) != SQLITE_NULL)
-        dev->history_end = sqlite3_column_int(stmt, 0);
-    sqlite3_finalize(stmt);
+    dt_image_get_history_end(imgid, &dev->history_end);
   }
 
   dt_ioppr_check_iop_order(dev, imgid, "dt_dev_read_history_no_image end");
 
+  // history_end is final: create the forms of the queued mask migrations, for
+  // the read below to pick up
+  dt_masks_finish_flexi_migrations(dev);
+
   dt_masks_read_masks_history(dev, imgid);
+
+  // after the read, which replaces dev->forms: this converts groups already in
+  // the database
+  dt_masks_normalize_flexi_groups(dev);
 
   // FIXME : this probably needs to capture dev thread lock
   if(dev->gui_attached && !no_image)
@@ -2878,14 +3099,15 @@ gboolean dt_dev_get_processed_size(dt_dev_viewport_t *port,
     return TRUE;
   }
 
-  const dt_develop_t *dev = darktable.develop;
+  const dt_develop_t *dev = (port && port->dev) ? port->dev : darktable.develop;
 
   // fallback on preview pipe
-  if(dev->preview_pipe && dev->preview_pipe->processed_width)
+  if(dev && dev->preview_pipe && dev->preview_pipe->processed_width)
   {
     const float scale = dev->preview_pipe->iscale;
     *procw = scale * dev->preview_pipe->processed_width;
     *proch = scale * dev->preview_pipe->processed_height;
+    return TRUE;
   }
   return FALSE;
 }
@@ -3148,10 +3370,25 @@ _dev_mask_overlay_bounds(const dt_develop_t *dev, float *x0, float *y0, float *x
 //   - by any overlay point already outside the image (e.g. a node dragged past
 //     the edge), plus MASK_HANDLE_MARGIN so it isn't flush to the border.
 // boxw/boxh are the viewport extents in image units along each axis.
-static void _clamp_zoom_to_mask(
-  const dt_develop_t *dev, const float boxw, const float boxh, float *zoom_x, float *zoom_y)
+// `occl0`/`occl1` are how much of the canvas an overlay hides on the left and
+// right, in the units of boxw (see dt_dev_viewport_t::occlusion_left), and
+// `used0`/`used1` receive how much of that the clamped position still uses
+static void _clamp_zoom_to_mask(const dt_develop_t *dev,
+                                const float boxw,
+                                const float boxh,
+                                const float occl0,
+                                const float occl1,
+                                float *used0,
+                                float *used1,
+                                float *zoom_x,
+                                float *zoom_y,
+                                const gboolean use_mask_overlay)
 {
-  const gboolean creating = dev->form_gui && dev->form_gui->creation;
+  // Pixelpipe workers use the image-only branch. form_gui and its point arrays
+  // are mutable presentation data owned by the GUI thread.
+  const gboolean creating = use_mask_overlay
+                            && dev->form_gui
+                            && dev->form_gui->creation;
 
   float lox = -0.5f, hix = 0.5f, loy = -0.5f, hiy = 0.5f;
   if(creating)
@@ -3162,7 +3399,8 @@ static void _clamp_zoom_to_mask(
     hiy += MASK_CREATION_MARGIN;
   }
   float mx0, my0, mx1, my1;
-  if(_dev_mask_overlay_bounds(dev, &mx0, &my0, &mx1, &my1))
+  if(use_mask_overlay
+     && _dev_mask_overlay_bounds(dev, &mx0, &my0, &mx1, &my1))
   {
     if(mx0 < -0.5f)
       lox = fminf(lox, mx0 - MASK_HANDLE_MARGIN);
@@ -3193,21 +3431,31 @@ static void _clamp_zoom_to_mask(
   const float halfw = 0.5f * boxw, halfh = 0.5f * boxh;
   const float homew = boxw >= 1.0f ? 0.0f : 0.5f - halfw;
   const float homeh = boxh >= 1.0f ? 0.0f : 0.5f - halfh;
-  const float cminx = (lox < -0.5f) ? lox : -homew;
-  const float cmaxx = (hix > 0.5f) ? hix : homew;
+  // the image is laid out for the whole canvas, overlay or not, so the center
+  // may travel one covered strip further on that side: what lies under the
+  // overlay can be pulled out into view
+  const float basex0 = (lox < -0.5f) ? lox : -homew;
+  const float basex1 = (hix > 0.5f) ? hix : homew;
+  const float cminx = basex0 - occl0;
+  const float cmaxx = basex1 + occl1;
   const float cminy = (loy < -0.5f) ? loy : -homeh;
   const float cmaxy = (hiy > 0.5f) ? hiy : homeh;
   *zoom_x = CLAMP(*zoom_x, cminx, cmaxx);
   *zoom_y = CLAMP(*zoom_y, cminy, cmaxy);
+
+  // how much of the allowance the clamped position still uses
+  *used0 = fmaxf(0.0f, basex0 - *zoom_x);
+  *used1 = fmaxf(0.0f, *zoom_x - basex1);
 }
 
-void dt_dev_zoom_move(dt_dev_viewport_t *port,
-                      dt_dev_zoom_t zoom,
-                      float scale,
-                      int closeup,
-                      const float x,
-                      const float y,
-                      const gboolean constrain)
+static void _dev_zoom_move(dt_dev_viewport_t *port,
+                           dt_dev_zoom_t zoom,
+                           float scale,
+                           int closeup,
+                           const float x,
+                           const float y,
+                           const gboolean constrain,
+                           const gboolean use_mask_overlay)
 {
   // Use the viewport's own develop, or fall back to global
   dt_develop_t *dev = port->dev ? port->dev : darktable.develop;
@@ -3224,11 +3472,11 @@ void dt_dev_zoom_move(dt_dev_viewport_t *port,
   const dt_dev_zoom_t old_zoom = port->zoom;
   int old_closeup = port->closeup;
 
-  int procw, proch;
+  int procw = 0, proch = 0;
   dt_dev_get_processed_size(port, &procw, &proch);
 
-  float zoom_x = pts[0] / procw - 0.5f;
-  float zoom_y = pts[1] / proch - 0.5f;
+  float zoom_x = (procw > 0) ? (pts[0] / procw - 0.5f) : 0.0f;
+  float zoom_y = (proch > 0) ? (pts[1] / proch - 0.5f) : 0.0f;
 
   const float cur_scale = dt_dev_get_zoom_scale(port, port->zoom, 1<<port->closeup, FALSE);
 
@@ -3239,8 +3487,8 @@ void dt_dev_zoom_move(dt_dev_viewport_t *port,
   }
   else if(zoom == DT_ZOOM_MOVE)
   {
-    zoom_x += scale * x / (procw * cur_scale);
-    zoom_y += scale * y / (proch * cur_scale);
+    if(procw > 0 && cur_scale > 0.0f) zoom_x += scale * x / (procw * cur_scale);
+    if(proch > 0 && cur_scale > 0.0f) zoom_y += scale * y / (proch * cur_scale);
     if(closeup) ++old_closeup; // force refresh
   }
   else
@@ -3368,7 +3616,21 @@ void dt_dev_zoom_move(dt_dev_viewport_t *port,
 
     // While editing a mask, allow panning beyond the canvas to reach
     // handles that lie outside the image (see helper for the details).
-    _clamp_zoom_to_mask(dev, boxw, boxh, &zoom_x, &zoom_y);
+    // the held allowance, not the raw occlusion: an overlay that has just been
+    // hidden still has its allowance until the view stops needing it
+    const float pw = procw * new_scale;
+    const float occl0 = pw > 0.0f ? port->occlusion_hold_left / pw : 0.0f;
+    const float occl1 = pw > 0.0f ? port->occlusion_hold_right / pw : 0.0f;
+    float used0 = 0.0f, used1 = 0.0f;
+    _clamp_zoom_to_mask(dev, boxw, boxh, occl0, occl1, &used0, &used1,
+                        &zoom_x, &zoom_y, use_mask_overlay);
+
+    // give back whatever the settled position no longer leans on, but never
+    // below what is covered right now
+    port->occlusion_hold_left =
+      MAX(port->occlusion_left, MIN(port->occlusion_hold_left, (int32_t)ceilf(used0 * pw)));
+    port->occlusion_hold_right =
+      MAX(port->occlusion_right, MIN(port->occlusion_hold_right, (int32_t)ceilf(used1 * pw)));
   }
 
   pts[0] = (zoom_x + 0.5f) * procw;
@@ -3415,6 +3677,20 @@ void dt_dev_zoom_move(dt_dev_viewport_t *port,
     dt_control_navigation_redraw();
 }
 
+void dt_dev_zoom_move(dt_dev_viewport_t *port,
+                      dt_dev_zoom_t zoom,
+                      float scale,
+                      int closeup,
+                      const float x,
+                      const float y,
+                      const gboolean constrain)
+{
+  // Public callers are GUI/input paths and retain off-image mask-handle
+  // panning. Worker-side viewport validation calls _dev_zoom_move() directly
+  // with use_mask_overlay=FALSE.
+  _dev_zoom_move(port, zoom, scale, closeup, x, y, constrain, TRUE);
+}
+
 void dt_dev_get_pointer_zoom_pos(dt_dev_viewport_t *port,
                                  const float px,
                                  const float py,
@@ -3432,8 +3708,8 @@ void dt_dev_get_pointer_zoom_pos(dt_dev_viewport_t *port,
   // offset from center now (current zoom_{x,y} points there)
   const float mouse_off_x = px - tb - .5f * port->width;
   const float mouse_off_y = py - tb - .5f * port->height;
-  zoom2_x += mouse_off_x / ((float)procw * scale);
-  zoom2_y += mouse_off_y / ((float)proch * scale);
+  if(procw > 0 && scale > 0.0f) zoom2_x += mouse_off_x / ((float)procw * scale);
+  if(proch > 0 && scale > 0.0f) zoom2_y += mouse_off_y / ((float)proch * scale);
   *zoom_x = zoom2_x + 0.5f;
   *zoom_y = zoom2_y + 0.5f;
   *zoom_scale = dt_dev_get_zoom_scale(port, zoom, 1<<closeup, TRUE);
@@ -3458,8 +3734,8 @@ void dt_dev_get_pointer_zoom_pos_from_bounds(dt_dev_viewport_t *port,
   // offset from center now (current zoom_{x,y} points there)
   const float mouse_off_x = px - tb - .5f * port->width;
   const float mouse_off_y = py - tb - .5f * port->height;
-  zoom2_x += mouse_off_x / ((float)procw * scale);
-  zoom2_y += mouse_off_y / ((float)proch * scale);
+  if(procw > 0 && scale > 0.0f) zoom2_x += mouse_off_x / ((float)procw * scale);
+  if(proch > 0 && scale > 0.0f) zoom2_y += mouse_off_y / ((float)proch * scale);
   *zoom_x = zoom2_x + 0.5f;
   *zoom_y = zoom2_y + 0.5f;
   *zoom_scale = dt_dev_get_zoom_scale(port, zoom, 1<<closeup, TRUE);
@@ -3478,13 +3754,45 @@ void dt_dev_get_viewport_params(dt_dev_viewport_t *port,
 
   if(x && y && port->pipe)
   {
-    float pts[2] = { port->zoom_x, port->zoom_y };
-    dt_dev_distort_transform_plus(port->dev ? port->dev : darktable.develop, port->pipe,
-                                  0.0f, DT_DEV_TRANSFORM_DIR_ALL_GEOMETRY, pts, 1);
-    *x = pts[0] / (float)port->pipe->processed_width - 0.5f;
-    *y = pts[1] / (float)port->pipe->processed_height - 0.5f;
+    // A pipe that hasn't produced dimensions yet (never processed, or in the
+    // middle of an image switch) would turn the normalisation below into a
+    // division by zero and send the viewport off to infinity.
+    if(port->pipe->processed_width && port->pipe->processed_height)
+    {
+      float pts[2] = { port->zoom_x, port->zoom_y };
+      dt_dev_distort_transform_plus(port->dev ? port->dev : darktable.develop,
+                                    port->pipe,
+                                    0,
+                                    DT_DEV_TRANSFORM_DIR_ALL_GEOMETRY,
+                                    pts,
+                                    1);
+      *x = pts[0] / (float)port->pipe->processed_width - 0.5f;
+      *y = pts[1] / (float)port->pipe->processed_height - 0.5f;
+    }
+    else
+      *x = *y = 0.0f;
   }
   dt_pthread_mutex_unlock(&(darktable.control->global_mutex));
+}
+
+void dt_dev_snapshot_zoom_pos(dt_dev_viewport_t *port)
+{
+  if(!port || !port->pipe)
+    return;
+
+  // Nothing worth carrying over when the image is shown at fit: the centre is
+  // forced home anyway, and a stale snapshot would fight the next fit.
+  if(port->zoom == DT_ZOOM_FIT || !port->pipe->processed_width || !port->pipe->processed_height)
+  {
+    port->restore_zoom = FALSE;
+    return;
+  }
+
+  float zx = 0.0f, zy = 0.0f;
+  dt_dev_get_viewport_params(port, NULL, NULL, &zx, &zy);
+  port->restore_zoom_x = CLAMP(zx, -0.5f, 0.5f);
+  port->restore_zoom_y = CLAMP(zy, -0.5f, 0.5f);
+  port->restore_zoom = TRUE;
 }
 
 gboolean dt_dev_is_current_image(const dt_develop_t *dev,
@@ -3554,7 +3862,8 @@ void dt_dev_exposure_handle_event(int n_press, gdouble delta,
                                   GdkModifierType state,
                                   const gboolean is_blackpoint)
 {
-  if(darktable.develop->proxy.exposure.handle_event)
+  if(dt_view_get_current() == DT_VIEW_DARKROOM
+      && darktable.develop->proxy.exposure.handle_event)
     darktable.develop->proxy.exposure.handle_event(n_press, delta, state, is_blackpoint);
 }
 
@@ -3634,28 +3943,9 @@ int dt_dev_modulegroups_basics_module_toggle(dt_develop_t *dev,
 
 void dt_dev_masks_list_change(dt_develop_t *dev)
 {
-  if(dev->proxy.masks.module && dev->proxy.masks.list_change)
-    dev->proxy.masks.list_change(dev->proxy.masks.module);
-}
-void dt_dev_masks_list_update(dt_develop_t *dev)
-{
-  if(dev->proxy.masks.module && dev->proxy.masks.list_update)
-    dev->proxy.masks.list_update(dev->proxy.masks.module);
-}
-
-void dt_dev_masks_list_remove(dt_develop_t *dev,
-                              const dt_mask_id_t formid,
-                              const dt_mask_id_t parentid)
-{
-  if(dev->proxy.masks.module && dev->proxy.masks.list_remove)
-    dev->proxy.masks.list_remove(dev->proxy.masks.module, formid, parentid);
-}
-void dt_dev_masks_selection_change(dt_develop_t *dev,
-                                   dt_iop_module_t *module,
-                                   const dt_mask_id_t selectid)
-{
-  if(dev->proxy.masks.module && dev->proxy.masks.selection_change)
-    dev->proxy.masks.selection_change(dev->proxy.masks.module, module, selectid);
+  // the canvas edits the focused module's mask, which the blend panel shows
+  if(dev->gui_attached && dev->gui_module)
+    dt_iop_gui_blend_masks_changed(dev->gui_module);
 }
 
 /** duplicate a existent module */
@@ -3821,7 +4111,7 @@ gboolean dt_dev_distort_transform(dt_develop_t *dev,
                                   const size_t points_count)
 {
   return dt_dev_distort_transform_plus(
-    dev, dev->preview_pipe, 0.0f, DT_DEV_TRANSFORM_DIR_ALL, points, points_count);
+    dev, dev->preview_pipe, 0, DT_DEV_TRANSFORM_DIR_ALL, points, points_count);
 }
 
 gboolean dt_dev_distort_backtransform(dt_develop_t *dev,
@@ -3829,12 +4119,12 @@ gboolean dt_dev_distort_backtransform(dt_develop_t *dev,
                                       const size_t points_count)
 {
   return dt_dev_distort_backtransform_plus(
-    dev, dev->preview_pipe, 0.0f, DT_DEV_TRANSFORM_DIR_ALL, points, points_count);
+    dev, dev->preview_pipe, 0, DT_DEV_TRANSFORM_DIR_ALL, points, points_count);
 }
 
 gboolean dt_dev_distort_transform_plus(dt_develop_t *dev,
                                        dt_dev_pixelpipe_t *pipe,
-                                       const double iop_order,
+                                       const int iop_order,
                                        const dt_dev_transform_direction_t transf_direction,
                                        float *points,
                                        const size_t points_count)
@@ -3849,7 +4139,7 @@ gboolean dt_dev_distort_transform_plus(dt_develop_t *dev,
 
 gboolean dt_dev_distort_backtransform_plus(dt_develop_t *dev,
                                            dt_dev_pixelpipe_t *pipe,
-                                           const double iop_order,
+                                           const int iop_order,
                                            const dt_dev_transform_direction_t transf_direction,
                                            float *points,
                                            const size_t points_count)
@@ -3880,7 +4170,7 @@ dt_dev_pixelpipe_iop_t *dt_dev_distort_get_iop_pipe(dt_develop_t *dev,
 
 dt_hash_t dt_dev_hash_plus(dt_develop_t *dev,
                            dt_dev_pixelpipe_t *pipe,
-                           const double iop_order,
+                           const int iop_order,
                            const dt_dev_transform_direction_t transf_direction)
 {
   dt_hash_t hash = DT_INITHASH;
@@ -3917,7 +4207,7 @@ dt_hash_t dt_dev_hash_plus(dt_develop_t *dev,
 
 static gboolean _dev_wait_hash(dt_develop_t *dev,
                                dt_dev_pixelpipe_t *pipe,
-                               const double iop_order,
+                               const int iop_order,
                                const dt_dev_transform_direction_t transf_direction,
                                dt_pthread_mutex_t *lock,
                                const volatile dt_hash_t *const hash)
@@ -3963,7 +4253,7 @@ static gboolean _dev_wait_hash(dt_develop_t *dev,
 
 gboolean dt_dev_sync_pixelpipe_hash(dt_develop_t *dev,
                                     dt_dev_pixelpipe_t *pipe,
-                                    const double iop_order,
+                                    const int iop_order,
                                     const dt_dev_transform_direction_t transf_direction,
                                     dt_pthread_mutex_t *lock,
                                     const volatile dt_hash_t *const hash)
@@ -3987,7 +4277,7 @@ gboolean dt_dev_sync_pixelpipe_hash(dt_develop_t *dev,
 
 dt_hash_t dt_dev_hash_distort_plus(dt_develop_t *dev,
                                    dt_dev_pixelpipe_t *pipe,
-                                   const double iop_order,
+                                   const int iop_order,
                                    const dt_dev_transform_direction_t transf_direction)
 {
   dt_hash_t hash = DT_INITHASH;
@@ -4143,16 +4433,34 @@ gboolean dt_dev_equal_chroma(const float *f, const double *d)
       && feqf(f[2], (float)d[2], 0.00001f);
 }
 
+// dev->chroma.temperature/adaptation are raw module pointers that nothing owns.
+// dt_iop_cleanup_module clears the one it frees, but the cache is written from
+// too many places to rely on that alone: a module missing from dev->iop has
+// been freed, whatever freed it, and must not be dereferenced
+static gboolean _chroma_module_alive(const dt_develop_t *dev,
+                                     const dt_iop_module_t *const module)
+{
+  if(!module) return FALSE;
+  for(const GList *m = dev->iop; m; m = g_list_next(m))
+    if(m->data == module) return TRUE;
+
+  // loud on purpose: some write site left a dangling module in the cache
+  dt_print(DT_DEBUG_ALWAYS,
+           "[chroma] stale module %p in dev->chroma (not in dev->iop) -- ignored",
+           (const void *)module);
+  return FALSE;
+}
+
 void dt_dev_clear_chroma_troubles(dt_develop_t *dev)
 {
   if(!dev->gui_attached)
     return;
 
   dt_dev_chroma_t *chr = &dev->chroma;
-  if(chr->temperature)
-    dt_iop_set_module_trouble_message(chr->temperature, NULL, NULL, NULL);
-  if(chr->adaptation)
-    dt_iop_set_module_trouble_message(chr->adaptation, NULL, NULL, NULL);
+  if(_chroma_module_alive(dev, chr->temperature))
+    dt_iop_clear_module_trouble_message(chr->temperature);
+  if(_chroma_module_alive(dev, chr->adaptation))
+    dt_iop_clear_module_trouble_message(chr->adaptation);
 }
 
 void dt_dev_reset_chroma(dt_develop_t *dev)

@@ -165,6 +165,12 @@ endif()
 FILE(COPY wb_presets.json DESTINATION "${DARKTABLE_DATADIR}")
 install(FILES wb_presets.json DESTINATION ${CMAKE_INSTALL_DATAROOTDIR}/darktable COMPONENT DTApplication)
 
+#
+# Install the masks panel's built-in group layout presets
+#
+FILE(COPY masks_group_presets.json DESTINATION "${DARKTABLE_DATADIR}")
+install(FILES masks_group_presets.json DESTINATION ${CMAKE_INSTALL_DATAROOTDIR}/darktable COMPONENT DTApplication)
+
 if(USE_AI)
   #
   # Install AI models registry
@@ -174,6 +180,14 @@ if(USE_AI)
   FILE(COPY ort_gpu.json DESTINATION "${DARKTABLE_DATADIR}")
   install(FILES ort_gpu.json DESTINATION ${CMAKE_INSTALL_DATAROOTDIR}/darktable COMPONENT DTApplication)
 endif(USE_AI)
+
+if(USE_MCP)
+  #
+  # Install darktable-mcp tool descriptions/schemas (editable without a rebuild)
+  #
+  FILE(COPY mcp_tools.json DESTINATION "${DARKTABLE_DATADIR}")
+  install(FILES mcp_tools.json DESTINATION ${CMAKE_INSTALL_DATAROOTDIR}/darktable COMPONENT DTApplication)
+endif(USE_MCP)
 
 #
 # Transform darktableconfig.xml into darktablerc

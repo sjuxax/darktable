@@ -70,10 +70,13 @@ constant sampler_t samplerA = CLK_NORMALIZED_COORDS_FALSE | CLK_ADDRESS_NONE    
   #define dtcl_exp2(A) native_exp2(A)
   #define dtcl_sin(A) native_sin(A)
   #define dtcl_cos(A) native_cos(A)
+  #define dtcl_exp(A) native_exp(A)
+  #define dtcl_exp10(A) native_exp10(A)
+  #define dtcl_log10(A) native_log10(A)
 
   static inline float dt_fast_hypot(const float x, const float y)
   {
-    return native_sqrt(x * x + y * y);
+    return sqrt(x * x + y * y);
   }
 
   // Allow the compiler to convert a * b + c to fused multiply-add to use hardware acceleration
@@ -90,6 +93,9 @@ constant sampler_t samplerA = CLK_NORMALIZED_COORDS_FALSE | CLK_ADDRESS_NONE    
   #define dtcl_exp2(A) exp2(A)
   #define dtcl_sin(A) sin(A)
   #define dtcl_cos(A) cos(A)
+  #define dtcl_exp(A) exp(A)
+  #define dtcl_exp10(A) exp10(A)
+  #define dtcl_log10(A) log10(A)
 
   static inline float dt_fast_hypot(const float x, const float y)
   {
@@ -115,6 +121,24 @@ static inline float scharr_gradient(global float *in, const int k, const int w)
   const float gy = 47.0f / 255.0f * (in[k-w-1] - in[k+w-1] + in[k-w+1] - in[k+w+1])
                 + 162.0f / 255.0f * (in[k-w]   - in[k+w]);
   return dt_fast_hypot(gx, gy);
+}
+
+static inline float fp32_div(const float a, const float b)
+{
+  /** OpenCL accepts an error of ~2.5 for a default division, full IEEE precision
+      can be enforced wit a global compiler flag but that is not supported on all
+      drivers/platforms.
+      As almost all platforms support fma() we can use Newton-Raphson refinement
+      of the quotient for precise results.
+      (See OpenCL manuals like from nvidia, amd ... they use such code)
+      Also rawprepare uses this already.
+  */
+  float y = native_recip(b);
+  float e = fma(-b, y, 1.0f);
+  y = fma(y, e, y);
+  float q = a * y;
+  float r = fma(-b, q, a);
+  return fma(r, y, q);
 }
 
 static inline int

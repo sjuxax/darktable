@@ -1,6 +1,6 @@
 /*
   This file is part of darktable,
-  Copyright (C) 2020-2024 darktable developers.
+  Copyright (C) 2020-2026 darktable developers.
 
   darktable is free software: you can redistribute it and/or modify
   it under the terms of the GNU General Public License as published by
@@ -32,7 +32,7 @@
 #include "gui/gtk.h"
 #include "gui/presets.h"
 #include "iop/iop_api.h"
-#include <assert.h>
+
 #include <gtk/gtk.h>
 #include <math.h>
 #include <stdlib.h>
@@ -108,6 +108,9 @@ static inline void make_noise(float *const output,
                               const size_t width,
                               const size_t height)
 {
+  const uint32_t splitmix32_1337 = splitmix32(1337);
+  const uint32_t splitmix32_666 = splitmix32(666);
+
   DT_OMP_FOR(collapse(2))
   for(size_t i = 0; i < height; i++)
     for(size_t j = 0; j < width; j++)
@@ -115,8 +118,8 @@ static inline void make_noise(float *const output,
       // Init random number generator
       uint32_t DT_ALIGNED_ARRAY state[4] = { splitmix32(j + 1),
                                              splitmix32((j + 1) * (i + 3)),
-                                             splitmix32(1337),
-                                             splitmix32(666) };
+                                             splitmix32_1337,
+                                             splitmix32_666 };
       xoshiro128plus(state);
       xoshiro128plus(state);
       xoshiro128plus(state);
@@ -252,9 +255,6 @@ void process(dt_iop_module_t *self,
   if(sigma_2 != 0.f)
   {
     output = out;
-
-    if(noise != 0.f)
-      make_noise(output, noise, width, height);
 
     dt_gaussian_t *g = dt_gaussian_init(width, height, ch, RGBmax, RGBmin, sigma_2, 0);
     if(!g) return;

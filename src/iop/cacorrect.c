@@ -373,7 +373,7 @@ void process(dt_iop_module_t *self,
     // A reminder, be very careful if you try to optimize the parallel processing loop
     // for not breaking multipass mode and clang/gcc differences.
     // See darktable file history and related problems before doing so.
-    DT_OMP_PRAGMA(parallel)
+    DT_OMP_PRAGMA(parallel num_threads(darktable.num_openmp_threads))
     {
       // direction of the CA shift in a tile
       int GRBdir[2][3];
@@ -1019,14 +1019,14 @@ void process(dt_iop_module_t *self,
               for(int cc = borderh + (FC(rr, 2, filters) & 1), c = FC(rr, cc, filters); cc < cc1 - borderh; cc += 2)
               {
                 // perform CA correction using colour ratios or colour differences
-                const float Ginthfloor = interpolatef(shifthfrac[c],
-                                                      rgb[1][(rr + shiftvfloor[c]) * ts + cc + shifthceil[c]],
-                                                      rgb[1][(rr + shiftvfloor[c]) * ts + cc + shifthfloor[c]]);
-                const float Ginthceil = interpolatef(shifthfrac[c],
-                                                      rgb[1][(rr + shiftvceil[c]) * ts + cc + shifthceil[c]],
-                                                      rgb[1][(rr + shiftvceil[c]) * ts + cc + shifthfloor[c]]);
+                const float Ginthfloor = mixf(rgb[1][(rr + shiftvfloor[c]) * ts + cc + shifthfloor[c]],
+                                              rgb[1][(rr + shiftvfloor[c]) * ts + cc + shifthceil[c]],
+                                              shifthfrac[c]);
+                const float Ginthceil = mixf(rgb[1][(rr + shiftvceil[c]) * ts + cc + shifthfloor[c]],
+                                             rgb[1][(rr + shiftvceil[c]) * ts + cc + shifthceil[c]],
+                                             shifthfrac[c]);
                 // Gint is bilinear interpolation of G at CA shift point
-                const float Gint = interpolatef(shiftvfrac[c], Ginthceil, Ginthfloor);
+                const float Gint = mixf(Ginthfloor, Ginthceil, shiftvfrac[c]);
 
                 // determine R/B at grid points using colour differences at shift point plus interpolated G value at grid point
                 // but first we need to interpolate G-R/G-B to grid points...
@@ -1050,14 +1050,14 @@ void process(dt_iop_module_t *self,
               {
                 const float grbdiffold = rgb[1][indx] - rgb[c][indx];
                 // interpolate colour difference from optical R/B locations to grid locations
-                const float grbdiffinthfloor = interpolatef(shifthfrac[c],
-                                                            grbdiff[(indx - GRBdir[1][c]) >> 1],
-                                                            grbdiff[indx >> 1]);
-                const float grbdiffinthceil  = interpolatef(shifthfrac[c],
-                                                            grbdiff[((rr - GRBdir[0][c]) * ts + cc - GRBdir[1][c]) >> 1],
-                                                            grbdiff[((rr - GRBdir[0][c]) * ts + cc) >> 1]);
+                const float grbdiffinthfloor = mixf(grbdiff[indx >> 1],
+                                                    grbdiff[(indx - GRBdir[1][c]) >> 1],
+                                                    shifthfrac[c]);
+                const float grbdiffinthceil  = mixf(grbdiff[((rr - GRBdir[0][c]) * ts + cc) >> 1],
+                                                    grbdiff[((rr - GRBdir[0][c]) * ts + cc - GRBdir[1][c]) >> 1],
+                                                    shifthfrac[c]);
                 // grbdiffint is bilinear interpolation of G-R/G-B at grid point
-                float grbdiffint = interpolatef(shiftvfrac[c], grbdiffinthceil, grbdiffinthfloor);
+                float grbdiffint = mixf(grbdiffinthfloor, grbdiffinthceil, shiftvfrac[c]);
 
                 // now determine R/B at grid points using interpolated colour differences and interpolated G value at grid point
                 const float RBint = rgb[1][indx] - grbdiffint;
@@ -1278,6 +1278,7 @@ void init_pipe(dt_iop_module_t *self, dt_dev_pixelpipe_t *pipe, dt_dev_pixelpipe
 
 void cleanup_pipe(dt_iop_module_t *self, dt_dev_pixelpipe_t *pipe, dt_dev_pixelpipe_iop_t *piece)
 {
+  free(piece->data);
   piece->data = NULL;
 }
 

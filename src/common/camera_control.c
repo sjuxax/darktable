@@ -21,6 +21,8 @@
 #include "common/image.h"
 #include "control/control.h"
 #include "imageio/imageio_jpeg.h"
+
+#include <glib-2.0/gio/gmenu.h>
 #include <gphoto2/gphoto2-file.h>
 
 #include <fcntl.h>
@@ -29,7 +31,6 @@
 #include <errno.h>
 #include <locale.h>
 
-/***/
 typedef enum _camctl_camera_job_type_t
 {
   /** Start a scan of devices and announce new and removed. */
@@ -579,7 +580,7 @@ static void *_camctl_camera_get_live_view(void *data)
   double capture_time = dt_get_wtime();
   const int fps = dt_conf_get_int("plugins/capture/camera/live_view_fps");
 
-  while(cam->is_live_viewing == TRUE)
+  while(cam->is_live_viewing)
   {
     dt_pthread_mutex_BAD_lock(&cam->live_view_synch);
 
@@ -686,8 +687,8 @@ static void _camctl_unlock(const dt_camctl_t *c)
 static void *_update_cameras_thread(void *ptr);
 dt_camctl_t *dt_camctl_new()
 {
-  dt_camctl_t *camctl = g_malloc0(sizeof(dt_camctl_t));
-  if(camctl == NULL)
+  dt_camctl_t *camctl = g_try_malloc0(sizeof(dt_camctl_t));
+  if(!camctl)
     return NULL;
 
   dt_print(DT_DEBUG_CAMCTL, "[camera_control] creating new context %p", camctl);
@@ -711,8 +712,8 @@ dt_camctl_t *dt_camctl_new()
            "[camera_control] loaded %d camera drivers",
            gp_abilities_list_count(camctl->gpcams));
 
-  dt_pthread_mutex_init(&camctl->lock, NULL);
-  dt_pthread_mutex_init(&camctl->listeners_lock, NULL);
+  dt_pthread_mutex_init(&camctl->lock);
+  dt_pthread_mutex_init(&camctl->listeners_lock);
 
   /* create thread taking care of connecting gphoto2 devices */
   if(dt_control_running())
@@ -893,7 +894,7 @@ static gboolean _camctl_update_cameras(const dt_camctl_t *c)
     // have it active while debugging
     if(!(strncmp(testcam->port, "disk:", 5)) && !(darktable.unmuted & DT_DEBUG_CAMCTL))
     {
-      g_free(testcam);
+      _camctl_unused_camera_destroy(testcam);
       continue;
     }
 
@@ -910,7 +911,7 @@ static gboolean _camctl_update_cameras(const dt_camctl_t *c)
                testcam->model, testcam->port);
       camctl->changed_camera = TRUE;
     }
-    g_free(testcam);
+    _camctl_unused_camera_destroy(testcam);
   }
 
   /* check unused_cameras being unplugged */
@@ -1104,7 +1105,7 @@ static void *_camera_event_thread(void *data)
   dt_print(DT_DEBUG_CAMCTL,
            "[camera_control] starting camera event thread of context %p", data);
 
-  while(camera->is_tethering == TRUE)
+  while(camera->is_tethering)
   {
     // Poll event from camera
     _camera_poll_events(camctl, camera);
@@ -1126,6 +1127,12 @@ static gboolean _camera_initialize(const dt_camctl_t *c,
   dt_camctl_t *camctl = (dt_camctl_t *)c;
   CameraAbilities a;
   GPPortInfo pi;
+
+  dt_pthread_mutex_init(&cam->jobqueue_lock);
+  dt_pthread_mutex_init(&cam->config_lock);
+  dt_pthread_mutex_init(&cam->live_view_buffer_mutex);
+  dt_pthread_mutex_init(&cam->live_view_synch);
+
   if(cam->gpcam == NULL)
   {
     gp_camera_new(&cam->gpcam);
@@ -1236,10 +1243,6 @@ static gboolean _camera_initialize(const dt_camctl_t *c,
     // initialize the list of open gphoto files
     cam->open_gpfiles = NULL;
     cam->is_importing = FALSE;
-    dt_pthread_mutex_init(&cam->jobqueue_lock, NULL);
-    dt_pthread_mutex_init(&cam->config_lock, NULL);
-    dt_pthread_mutex_init(&cam->live_view_buffer_mutex, NULL);
-    dt_pthread_mutex_init(&cam->live_view_synch, NULL);
 
     dt_print(DT_DEBUG_CAMCTL,
              "[camera_control] %s on port %s initialized", cam->model, cam->port);
@@ -1624,7 +1627,7 @@ void dt_camctl_tether_mode(const dt_camctl_t *c,
     dt_camctl_t *camctl = (dt_camctl_t *)c;
     dt_camera_t *camera = (dt_camera_t *)cam;
 
-    if(enable == TRUE && camera->is_tethering != TRUE)
+    if(enable && !camera->is_tethering)
     {
       _camctl_lock(c, cam);
       // Start up camera event polling thread
@@ -1665,7 +1668,7 @@ const char *dt_camctl_camera_get_model(const dt_camctl_t *c,
 
 
 static void _camera_build_property_menu(CameraWidget *widget,
-                                        GtkMenu *menu,
+                                        GMenu *menu,
                                         GCallback item_activate,
                                         gpointer user_data)
 {
@@ -1686,23 +1689,16 @@ static void _camera_build_property_menu(CameraWidget *widget,
       if(gp_widget_count_children(child) > 0)
       {
         /* create submenu item */
-        GtkMenuItem *item = GTK_MENU_ITEM(gtk_menu_item_new_with_label(sk));
-        gtk_menu_item_set_submenu(item, gtk_menu_new());
+        GMenu *submenu = g_menu_new();
 
         /* recurse into submenu */
         _camera_build_property_menu(child,
-                                    GTK_MENU(gtk_menu_item_get_submenu(item)),
+                                    submenu,
                                     item_activate,
                                     user_data);
 
-        /* add submenu item to menu if not empty*/
-        GList *children =
-          gtk_container_get_children(GTK_CONTAINER(gtk_menu_item_get_submenu(item)));
-        if(children)
-        {
-          gtk_menu_shell_append(GTK_MENU_SHELL(menu), GTK_WIDGET(item));
-          g_list_free(children);
-        }
+        g_menu_append_submenu(menu, sk, G_MENU_MODEL(submenu));
+        g_object_unref(submenu);
       }
       else
       {
@@ -1714,10 +1710,12 @@ static void _camera_build_property_menu(CameraWidget *widget,
         {
           /* construct menu item for property */
           gp_widget_get_name(child, &sk);
-          GtkMenuItem *item = GTK_MENU_ITEM(gtk_menu_item_new_with_label(sk));
-          g_signal_connect(G_OBJECT(item), "activate", G_CALLBACK(item_activate), user_data);
-          /* add submenu item to menu */
-          gtk_menu_shell_append(GTK_MENU_SHELL(menu), GTK_WIDGET(item));
+
+          gchar *action = g_strdup_printf("camera.activate::%s", sk);
+          GMenuItem *item = g_menu_item_new(sk, action);
+          g_free(action);
+          g_menu_append_item(menu, item);
+          g_object_unref(item);
         }
       }
     }
@@ -1726,7 +1724,7 @@ static void _camera_build_property_menu(CameraWidget *widget,
 
 void dt_camctl_camera_build_property_menu(const dt_camctl_t *c,
                                           const dt_camera_t *cam,
-                                          GtkMenu **menu,
+                                          GMenu **menu,
                                           GCallback item_activate,
                                           gpointer user_data)
 {
@@ -1747,7 +1745,7 @@ void dt_camctl_camera_build_property_menu(const dt_camctl_t *c,
   /* lock camera config mutex while recursive building property menu */
   dt_camera_t *camera = (dt_camera_t *)cam;
   dt_pthread_mutex_lock(&camera->config_lock);
-  *menu = GTK_MENU(gtk_menu_new());
+  *menu = g_menu_new();
   _camera_build_property_menu(camera->configuration, *menu, item_activate, user_data);
   gtk_widget_show_all(GTK_WIDGET(*menu));
   dt_pthread_mutex_unlock(&camera->config_lock);
@@ -1772,7 +1770,8 @@ void dt_camctl_camera_set_property_string(const dt_camctl_t *c,
   dt_camera_t *camera = (dt_camera_t *)cam;
 
   _camctl_camera_set_property_string_job_t *job =
-    g_malloc(sizeof(_camctl_camera_set_property_string_job_t));
+    g_try_malloc(sizeof(_camctl_camera_set_property_string_job_t));
+  if(!job) return;
   job->type = _JOB_TYPE_SET_PROPERTY_STRING;
   job->name = g_strdup(property_name);
   job->value = g_strdup(value);
@@ -1797,7 +1796,8 @@ void dt_camctl_camera_set_property_toggle(const dt_camctl_t *c,
   dt_camera_t *camera = (dt_camera_t *)cam;
 
   _camctl_camera_set_property_toggle_job_t *job =
-    g_malloc(sizeof(_camctl_camera_set_property_toggle_job_t));
+    g_try_malloc(sizeof(_camctl_camera_set_property_toggle_job_t));
+  if(!job) return;
   job->type = _JOB_TYPE_SET_PROPERTY_TOGGLE;
   job->name = g_strdup(property_name);
 
@@ -1822,7 +1822,8 @@ void dt_camctl_camera_set_property_choice(const dt_camctl_t *c,
   dt_camera_t *camera = (dt_camera_t *)cam;
 
   _camctl_camera_set_property_choice_job_t *job =
-    g_malloc(sizeof(_camctl_camera_set_property_choice_job_t));
+    g_try_malloc(sizeof(_camctl_camera_set_property_choice_job_t));
+  if(!job) return;
   job->type = _JOB_TYPE_SET_PROPERTY_CHOICE;
   job->name = g_strdup(property_name);
   job->value = value;
@@ -1848,7 +1849,8 @@ void dt_camctl_camera_set_property_int(const dt_camctl_t *c,
   dt_camera_t *camera = (dt_camera_t *)cam;
 
   _camctl_camera_set_property_int_job_t *job =
-    g_malloc(sizeof(_camctl_camera_set_property_int_job_t));
+    g_try_malloc(sizeof(_camctl_camera_set_property_int_job_t));
+  if(!job) return;
   job->type = _JOB_TYPE_SET_PROPERTY_INT;
   job->name = g_strdup(property_name);
   job->value = value;
@@ -1874,8 +1876,9 @@ void dt_camctl_camera_set_property_float(const dt_camctl_t *c,
   dt_camera_t *camera = (dt_camera_t *)cam;
 
   _camctl_camera_set_property_float_job_t *job =
-    g_malloc(sizeof(_camctl_camera_set_property_int_job_t));
-  job->type = _JOB_TYPE_SET_PROPERTY_INT;
+    g_try_malloc(sizeof(_camctl_camera_set_property_float_job_t));
+  if(!job) return;
+  job->type = _JOB_TYPE_SET_PROPERTY_FLOAT;
   job->name = g_strdup(property_name);
   job->value = value;
 
@@ -2071,7 +2074,8 @@ void dt_camctl_camera_capture(const dt_camctl_t *c,
   }
   dt_camera_t *camera = (dt_camera_t *)cam;
 
-  _camctl_camera_job_t *job = g_malloc(sizeof(_camctl_camera_job_t));
+  _camctl_camera_job_t *job = g_try_malloc(sizeof(_camctl_camera_job_t));
+  if(!job) return;
   job->type = _JOB_TYPE_EXECUTE_CAPTURE;
   _camera_add_job(camctl, camera, job);
 }

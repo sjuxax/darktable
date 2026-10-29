@@ -40,6 +40,9 @@ typedef struct _workspace_t {
   GtkWidget *template_radio_leader;
   const char *datadir;
   char *selected_template;
+  // TRUE once the user picks or creates a workspace; closing the dialog
+  // without choosing leaves it FALSE
+  gboolean selected;
 } dt_workspace_t;
 
 static gboolean _workspace_label_is_default(const char *label)
@@ -386,6 +389,7 @@ static void _workspace_select_db(GtkWidget *button,
   if(gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(session->remember_selection_check)))
     dt_conf_set_bool("database/multiple_workspace", FALSE);
 
+  session->selected = TRUE;
   _workspace_screen_destroy(session);
 }
 
@@ -444,6 +448,7 @@ static void _workspace_new_db(GtkWidget *button,
     dt_conf_set_bool("database/multiple_workspace", FALSE);
 
   g_free(label);
+  session->selected = TRUE;
   _workspace_screen_destroy(session);
 }
 
@@ -510,9 +515,11 @@ static GtkWidget *_insert_button(dt_workspace_t *session,
 
   if(with_del)
   {
-    del = dtgtk_button_new(dtgtk_cairo_paint_remove, 0, NULL);
-    g_signal_connect(G_OBJECT(del), "clicked",
-                     G_CALLBACK(_workspace_delete_db), session);
+    del = dtgtk_button_new_full(dtgtk_cairo_paint_remove, 0, NULL,
+      &(dtgtk_button_config_t){
+        .clicked_cb = G_CALLBACK(_workspace_delete_db),
+        .clicked_data = session,
+      });
     g_object_set_data(G_OBJECT(del), "db", b);
     gtk_grid_attach(GTK_GRID(session->grid), del, 2, row, 1, 1);
 
@@ -553,7 +560,7 @@ gboolean dt_workspace_create(const char *datadir)
   session->grid = gtk_grid_new();
   gtk_grid_set_column_spacing(GTK_GRID(session->grid), 5);
   gtk_grid_set_row_spacing(GTK_GRID(session->grid), 5);
-  gtk_widget_set_valign(session->grid, GTK_ALIGN_CENTER);
+  gtk_widget_set_valign(session->grid, GTK_ALIGN_START);
   dt_gui_add_class(session->grid, "dt_workspace_template_radio_cell");
 
   // a simple gtk_dialog_new() leaves us unable to setup the header
@@ -572,6 +579,7 @@ gboolean dt_workspace_create(const char *datadir)
                                 GTK_RESPONSE_NONE,
                                 NULL);
 
+  gtk_window_set_resizable(GTK_WINDOW(session->db_screen), FALSE);
   gtk_window_set_position(GTK_WINDOW(session->db_screen), GTK_WIN_POS_CENTER);
 
   GList *dbs = dt_read_file_pattern(datadir, "library-*.db");
@@ -609,7 +617,17 @@ gboolean dt_workspace_create(const char *datadir)
       current_db_found = TRUE;
   }
 
-  dt_gui_dialog_add(session->db_screen, session->grid);
+  GtkWidget *sw = gtk_scrolled_window_new(NULL, NULL);
+  gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(sw),
+                                 GTK_POLICY_NEVER,
+                                 GTK_POLICY_AUTOMATIC);
+  gtk_scrolled_window_set_propagate_natural_height(GTK_SCROLLED_WINDOW(sw), TRUE);
+  gtk_scrolled_window_set_propagate_natural_width(GTK_SCROLLED_WINDOW(sw), TRUE);
+  gtk_scrolled_window_set_overlay_scrolling(GTK_SCROLLED_WINDOW(sw), FALSE);
+  gtk_widget_set_vexpand(sw, FALSE);
+  gtk_widget_set_valign(sw, GTK_ALIGN_START);
+  gtk_container_add(GTK_CONTAINER(sw), session->grid);
+  dt_gui_dialog_add(session->db_screen, sw);
 
   GtkWidget *remember_box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 10);
   gtk_widget_set_valign(remember_box, GTK_ALIGN_CENTER);
@@ -665,15 +683,44 @@ gboolean dt_workspace_create(const char *datadir)
   gtk_widget_set_name(content, "workspace");
 
   gtk_widget_show_all(session->db_screen);
+
+  GtkWidget *sample = gtk_grid_get_child_at(GTK_GRID(session->grid), 1, 0);
+  gint unused = 0, row_h = 32;
+  if(sample)
+    gtk_widget_get_preferred_height(sample, &unused, &row_h);
+  if(row_h < 16) row_h = 32;
+
+  gint max_h = 8 * row_h + 7 * 5;
+
+  GdkMonitor *monitor =
+    gdk_display_get_primary_monitor(gtk_widget_get_display(session->db_screen));
+  if(monitor)
+  {
+    GdkRectangle work;
+    gdk_monitor_get_workarea(monitor, &work);
+    max_h = MIN(max_h, work.height / 2);
+  }
+
+  gtk_scrolled_window_set_max_content_height(GTK_SCROLLED_WINDOW(sw), max_h);
+  gtk_widget_queue_resize(session->db_screen);
+
   _workspace_template_radios_set_visible
     (session,
      gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(session->copy_template_check)));
-  while(gtk_dialog_run(GTK_DIALOG(session->db_screen)) == GTK_RESPONSE_ACCEPT);
+
+  gint dres = GTK_RESPONSE_CANCEL;
+  while((dres = gtk_dialog_run(GTK_DIALOG(session->db_screen))) == GTK_RESPONSE_ACCEPT);
+
+  if(dres == GTK_RESPONSE_DELETE_EVENT)
+    exit(0);
+
+  // only an actual choice may override the per-workspace rc
+  const gboolean selected = session->selected;
 
   _workspace_screen_destroy(session);
   g_free(session);
 
-  return TRUE;
+  return selected;
 }
 
 // clang-format off

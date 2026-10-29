@@ -23,7 +23,7 @@
 #define DT_OPENCL_MAX_KERNELS 512
 #define DT_OPENCL_EVENTNAMELENGTH 64
 #define DT_OPENCL_MAX_ERRORS 5
-#define DT_OPENCL_MAX_INCLUDES 8
+#define DT_OPENCL_MAX_INCLUDES 10
 #define DT_OPENCL_VENDOR_AMD 4098
 #define DT_OPENCL_VENDOR_NVIDIA 4318
 #define DT_OPENCL_VENDOR_APPLE 16940800
@@ -76,10 +76,10 @@ G_BEGIN_DECLS
 
 #define DT_OPENCL_DEFAULT_COMPILE_DEFAULT ("")
 #define DT_OPENCL_DEFAULT_COMPILE_OPTI ("-cl-fast-relaxed-math")
-#define DT_CLDEVICE_HEAD ("cldevice_v6_")
+#define DT_CLDEVICE_HEAD ("cldevice_v7_")
 
 // version for current darktable cl kernels reflected in the kernel directory
-#define DT_OPENCL_KERNELS 6
+#define DT_OPENCL_KERNELS 7
 
 typedef enum dt_opencl_memory_t
 {
@@ -111,12 +111,16 @@ typedef struct dt_opencl_eventtag_t
   char tag[DT_OPENCL_EVENTNAMELENGTH];
 } dt_opencl_eventtag_t;
 
-typedef enum dt_opencl_atomics_t
+typedef enum dt_opencl_extensions_t
 {
-  DT_OPENCL_ATOMIC_NONE = 0,
+  DT_OPENCL_EXTENSION_NONE = 0,
   DT_OPENCL_ATOMIC_INT32 = 1,
   DT_OPENCL_ATOMIC_FLOAT32 = 2,
-} dt_opencl_atomics_t;
+  DT_OPENCL_FLOAT64 = 4,
+  DT_OPENCL_ATOMIC_INT64 = 8,
+  DT_OPENCL_FMA = 16,
+  DT_OPENCL_EXACT = 32,
+} dt_opencl_extensions_t;
 
 /**
  * to support multi-gpu and mixed systems with cpu support,
@@ -134,7 +138,6 @@ typedef struct dt_opencl_device_t
   cl_ulong max_global_mem;
   cl_ulong used_global_mem;
   cl_ulong max_mem_constant;
-  cl_uint alignsize; 
   cl_uint compute_units;
   size_t workgroup_size; 
   size_t workgroup_size_rec;
@@ -168,18 +171,13 @@ typedef struct dt_opencl_device_t
   // flags if we want headroom mode
   gboolean tunehead;
   // we checked for atomic support; tested by avoid_atomics functions
-  dt_opencl_atomics_t atomic_support;
-  // pause OpenCL processing for this number of microseconds from time
-  // to time
-  int micro_nap;
+  dt_opencl_extensions_t extensions;
 
   // keep track of devices using unified memory so we can adopt
   // runtime code
   gboolean unified_memory;
   // fraction of system memory allowed for a device in percent
   float unified_fraction;
-
-  gboolean clmem_error;
 
   // in OpenCL processing round width/height of global work groups to
   // a multiple of these values.  reasonable values are powers of
@@ -230,6 +228,7 @@ typedef struct dt_opencl_t
   gboolean stopped;
   gboolean fastcl;  // for fast runtime checks instead of reading the conf
   gboolean fast_tiling;
+  gboolean no_fast_tiling;
   gboolean spurious;
   gboolean migrate;
   int num_devs;
@@ -252,6 +251,9 @@ typedef struct dt_opencl_t
 
   // global kernels for bilateral filtering, to be reused by a few plugins.
   struct dt_bilateral_cl_global_t *bilateral;
+
+  // global kernels for bilinear resampling of grey buffers.
+  struct dt_bilinear_cl_global_t *bilinear;
 
   // global kernels for gaussian filtering, to be reused by a few plugins.
   struct dt_gaussian_cl_global_t *gaussian;
@@ -293,15 +295,6 @@ typedef struct dt_opencl_local_buffer_t
   int sizex;  // initial value and final values after optimization
   int sizey;  // initial value and final values after optimization
 } dt_opencl_local_buffer_t;
-
-/** internally calls dt_clGetDeviceInfo, and takes care of memory
- * allocation afterwards, *param_value will point to memory block of
- * size at least *param_value which needs to be free()'d manually */
-int dt_opencl_get_device_info(dt_opencl_t *cl,
-                              cl_device_id device,
-                              cl_device_info param_name,
-                              void **param_value,
-                              size_t *param_value_size);
 
 /** inits the opencl subsystem. */
 void dt_opencl_init(dt_opencl_t *cl,
@@ -566,23 +559,17 @@ void dt_opencl_dump_pipe_pfm(const char* mod,
                              const gboolean input,
                              const char *pipe);
 
-void dt_opencl_memory_statistics(int devid,
-                                 const cl_mem mem,
-                                 dt_opencl_memory_t action);
-
 /** check if image size fits into limits given by OpenCL runtime */
 dt_opencl_tilemode_t dt_opencl_image_fits_device(const int devid,
                                                  const int width,
                                                  const int height,
-                                                 const uint32_t bpp,
+                                                 const int32_t ibpp,
+                                                 const int32_t obpp,
                                                  const float factor,
                                                  const size_t overhead,
                                                  const int overlap);
 /** get available memory for the device */
 cl_ulong dt_opencl_get_device_available(const int devid);
-
-/** get size of allocatable single buffer */
-cl_ulong dt_opencl_get_device_memalloc(const int devid);
 
 /** round size to a multiple of the value given in the device specifig
  * config parameter for opencl_size_roundup */
@@ -609,7 +596,6 @@ cl_int dt_opencl_local_buffer_opt(const int devid,
 
 /** utility functions handling device specific properties */
 gboolean dt_opencl_avoid_atomics(const int devid);
-void dt_opencl_micro_nap(const int devid);
 gboolean dt_opencl_unified_memory(const int devid);
 unsigned int dt_opencl_tiling_align(const int devid);
 
@@ -719,10 +705,6 @@ static inline void dt_opencl_update_settings(void)
   return ;
 }
 static inline size_t dt_opencl_get_device_available(const int devid)
-{
-  return 0;
-}
-static inline size_t dt_opencl_get_device_memalloc(const int devid)
 {
   return 0;
 }

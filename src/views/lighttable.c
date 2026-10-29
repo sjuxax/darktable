@@ -50,7 +50,6 @@
 #include "lua/image.h"
 #endif
 
-#include <assert.h>
 #include <dirent.h>
 #include <errno.h>
 #include <gdk/gdkkeysyms.h>
@@ -109,6 +108,12 @@ static void _preview_quit(dt_view_t *self)
   lib->preview_state = FALSE;
   // restore panels
   dt_ui_restore_panels(darktable.gui->ui);
+
+  // refresh the layout buttons: exiting full preview via a path that doesn't
+  // go through the layout button handlers (e.g. closing the main window while
+  // in preview, which exits preview instead of quitting dt) would otherwise
+  // leave the full preview icon stuck in its active state.
+  dt_view_lighttable_update_layout_buttons(darktable.view_manager);
 
   // show/hide filmstrip & timeline when entering the view
   if(lib->current_layout == DT_LIGHTTABLE_LAYOUT_CULLING
@@ -450,7 +455,9 @@ static gboolean is_image_visible_cb(lua_State *L)
 void cleanup(dt_view_t *self)
 {
   dt_library_t *lib = self->data;
+  dt_culling_destroy(lib->culling);
   free(lib->culling);
+  dt_culling_destroy(lib->preview);
   free(lib->preview);
   free(self->data);
 }
@@ -1473,8 +1480,10 @@ void gui_init(dt_view_t *self)
                                      DT_VIEW_LIGHTTABLE | DT_VIEW_DARKROOM);
 
   // create display profile button
-  GtkWidget *const profile_button = dtgtk_button_new(dtgtk_cairo_paint_display, 0, NULL);
-  gtk_widget_set_tooltip_text(profile_button, _("set display profile"));
+  GtkWidget *const profile_button = dtgtk_button_new_full(dtgtk_cairo_paint_display, 0, NULL,
+      &(dtgtk_button_config_t){
+        .tooltip = _("set display profile"),
+      });
   dt_view_manager_module_toolbox_add(darktable.view_manager,
                                      profile_button, DT_VIEW_LIGHTTABLE);
 

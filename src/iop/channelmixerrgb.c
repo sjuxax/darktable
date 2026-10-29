@@ -54,6 +54,7 @@
 #include "develop/openmp_maths.h"
 #include "gui/accelerators.h"
 #include "gui/color_picker_proxy.h"
+#include "control/control.h"
 #include "gui/gtk.h"
 #include "gui/presets.h"
 #include "iop/iop_api.h"
@@ -1205,8 +1206,12 @@ static void _declare_cat_on_pipe(dt_iop_module_t *self, const gboolean preset)
   }
 
   if(origcat != chr->adaptation)
-    dt_print(DT_DEBUG_PIPE, "changed CAT for %s%s from %p to %p",
-      self->op, dt_iop_get_instance_id(self), origcat, chr->adaptation);
+    dt_print(DT_DEBUG_PIPE, "changed CAT for %s%s from %s%s to %s%s",
+      self->op, dt_iop_get_instance_id(self),
+      origcat ? origcat->name() : "none",
+      origcat ? dt_iop_get_instance_id(origcat) : "",
+      chr->adaptation ? chr->adaptation->op : "none",
+      chr->adaptation ? dt_iop_get_instance_id(chr->adaptation) : "");
 }
 
 static void _update_illuminants(const dt_iop_module_t *self);
@@ -1992,14 +1997,14 @@ static void _set_trouble_messages(dt_iop_module_t *self)
   if(!chr->temperature)
   {
     if(chr->adaptation)
-      dt_iop_set_module_trouble_message(chr->adaptation, NULL, NULL, NULL);
+      dt_iop_clear_module_trouble_message(chr->adaptation);
     return;
   }
 
   if(!chr->adaptation)
   {
-    dt_iop_set_module_trouble_message(chr->temperature, NULL, NULL, NULL);
-    dt_iop_set_module_trouble_message(self, NULL, NULL, NULL);
+    dt_iop_clear_module_trouble_message(chr->temperature);
+    dt_iop_clear_module_trouble_message(self);
     return;
   }
 
@@ -2033,24 +2038,9 @@ static void _set_trouble_messages(dt_iop_module_t *self)
                             && !temperature_enabled
                             && chr->temperature->default_enabled;
 
-  const gboolean anyproblem = problem1 || problem2 || problem3;
-
-  const dt_image_t *img = &dev->image_storage;
-  dt_print_pipe(DT_DEBUG_PIPE, anyproblem ? "chroma trouble" : "chroma data",
-      NULL, self, DT_DEVICE_NONE, NULL, NULL,
-      "%s%s%sD65=%s.  D65 %.3f %.3f %.3f, AS-SHOT %.3f %.3f %.3f ID=%i",
-      problem1 ? "white balance applied twice, " : "",
-      problem2 ? "double CAT applied, " : "",
-      problem3 ? "white balance missing, " : "",
-      STR_YESNO(_dev_is_D65_chroma(dev)),
-      chr->D65coeffs[0], chr->D65coeffs[1], chr->D65coeffs[2],
-      chr->as_shot[0], chr->as_shot[1], chr->as_shot[2],
-      img->id);
-
   if(problem2)
   {
-    dt_iop_set_module_trouble_message
-      (self,
+    dt_iop_set_module_trouble_message(self,
         _("double CAT applied"),
         _("you have 2 instances or more of color calibration,\n"
           "all providing chromatic adaptation.\n"
@@ -2062,8 +2052,7 @@ static void _set_trouble_messages(dt_iop_module_t *self)
 
   if(problem1)
   {
-    dt_iop_set_module_trouble_message
-      (chr->temperature,
+    dt_iop_set_module_trouble_message(chr->temperature,
         _("white balance applied twice (<u>details</u>)"),
         _("the color calibration module is enabled and already provides\n"
           "chromatic adaptation.\n"
@@ -2071,8 +2060,7 @@ static void _set_trouble_messages(dt_iop_module_t *self)
           "or disable chromatic adaptation in color calibration."),
         NULL);
 
-    dt_iop_set_module_trouble_message
-      (self,
+    dt_iop_set_module_trouble_message(self,
         _("white balance module error (<u>details</u>)"),
         _("the white balance module is not using the camera\n"
           "reference illuminant, which will cause issues here\n"
@@ -2084,8 +2072,7 @@ static void _set_trouble_messages(dt_iop_module_t *self)
 
   if(problem3)
   {
-    dt_iop_set_module_trouble_message
-      (chr->temperature,
+    dt_iop_set_module_trouble_message(chr->temperature,
         _("white balance missing (<u>details</u>)"),
         _("this module is not providing a valid reference illuminant\n"
           "causing chromatic adaptation issues in color calibration.\n"
@@ -2093,8 +2080,7 @@ static void _set_trouble_messages(dt_iop_module_t *self)
           "or disable chromatic adaptation in color calibration."),
         NULL);
 
-    dt_iop_set_module_trouble_message
-      (self,
+    dt_iop_set_module_trouble_message(self,
         _("white balance missing (<u>details</u>)"),
         _("the white balance module is not providing a valid reference\n"
           "illuminant causing issues with chromatic adaptation here.\n"
@@ -2106,8 +2092,8 @@ static void _set_trouble_messages(dt_iop_module_t *self)
 
   if(chr->adaptation && chr->adaptation == self)
   {
-    dt_iop_set_module_trouble_message(chr->temperature, NULL, NULL, NULL);
-    dt_iop_set_module_trouble_message(self, NULL, NULL, NULL);
+    dt_iop_clear_module_trouble_message(chr->temperature);
+    dt_iop_clear_module_trouble_message(self);
   }
 }
 
@@ -2458,8 +2444,8 @@ static inline void _update_bounding_box(dt_iop_channelmixer_rgb_gui_data_t *g,
 }
 
 static inline void _init_bounding_box(dt_iop_channelmixer_rgb_gui_data_t *g,
-                                     const float width,
-                                     const float height)
+                                      const float width,
+                                      const float height)
 {
   if(!g->checker_ready)
   {
@@ -2588,11 +2574,7 @@ int mouse_moved(dt_iop_module_t *self,
   else
   {
     // fall back to default cursor
-    GdkCursor *const cursor =
-      gdk_cursor_new_from_name(gdk_display_get_default(), "default");
-    gdk_window_set_cursor(gtk_widget_get_window(dt_ui_main_window(darktable.gui->ui)),
-                          cursor);
-    g_object_unref(cursor);
+    dt_control_change_cursor("default");
   }
 
   dt_control_queue_redraw_center();
@@ -3819,7 +3801,11 @@ void gui_update(dt_iop_module_t *self)
 
   dt_iop_gui_enter_critical_section(self);
 
-  const int i = dt_conf_get_int("darkroom/modules/channelmixerrgb/colorchecker");
+  // an older darktablerc can point past the end of the list. Without the
+  // clamp, the combobox would show its last entry but dt_get_color_checker()
+  // would fall back to the X-Rite 24
+  const int i = MIN(dt_conf_get_int("darkroom/modules/channelmixerrgb/colorchecker"),
+                    COLOR_CHECKER_LAST - 1);
   dt_bauhaus_combobox_set(g->checkers_list, i);
   g->checker = dt_get_color_checker(i);
 
@@ -3971,7 +3957,7 @@ static void _spot_settings_changed_callback(GtkWidget *slider,
 
   // Re-run auto illuminant if color picker is active and mode is correct
   const dt_spot_mode_t mode = dt_bauhaus_combobox_get(g->spot_mode);
-  if(mode == DT_SPOT_MODE_CORRECT)
+  if(mode == DT_SPOT_MODE_CORRECT && dt_iop_color_picker_is_active(g->color_picker))
     _auto_set_illuminant(self, darktable.develop->full.pipe);
   // else : just record new values and do nothing
 }
@@ -4145,6 +4131,7 @@ void gui_changed(dt_iop_module_t *self,
 
   // If "as shot in camera" illuminant is used, CAT space is forced automatically
   // therefore, make the control insensitive
+  dt_bauhaus_combobox_set_from_value(g->adaptation, p->adaptation);
   gtk_widget_set_sensitive(g->adaptation, p->illuminant != DT_ILLUMINANT_CAMERA);
 
   _declare_cat_on_pipe(self, FALSE);
@@ -4409,7 +4396,6 @@ static void _auto_set_illuminant(dt_iop_module_t *self,
   }
 }
 
-
 void color_picker_apply(dt_iop_module_t *self,
                         GtkWidget *picker,
                         dt_dev_pixelpipe_t *pipe)
@@ -4418,6 +4404,11 @@ void color_picker_apply(dt_iop_module_t *self,
   _auto_set_illuminant(self, pipe);
 }
 
+static void _dt_active_images_callback(gpointer instance,
+                                       dt_iop_channelmixer_rgb_gui_data_t * g)
+{
+  g->checker_ready = FALSE;
+}
 
 void gui_init(dt_iop_module_t *self)
 {
@@ -4679,10 +4670,8 @@ void gui_init(dt_iop_module_t *self)
      0, _checker_changed_callback, self,
      N_("Xrite ColorChecker 24 pre-2014"),
      N_("Xrite/Calibrite ColorChecker 24 post-2014"),
-     N_("Datacolor SpyderCheckr 24 pre-2018"),
-     N_("Datacolor SpyderCheckr 24 post-2018"),
-     N_("Datacolor SpyderCheckr 48 pre-2018"),
-     N_("Datacolor SpyderCheckr 48 post-2018"),
+     N_("Datacolor SpyderCheckr 24"),
+     N_("Datacolor SpyderCheckr 48"),
      N_("Datacolor SpyderCheckr Photo"));
 
   DT_BAUHAUS_COMBOBOX_NEW_FULL
@@ -4716,45 +4705,60 @@ void gui_init(dt_iop_module_t *self)
   gtk_widget_set_tooltip_text(g->label_delta_E,
                               _("the delta E is using the CIE 2000 formula"));
 
-  g->button_commit = dtgtk_button_new(dtgtk_cairo_paint_check_mark, 0, NULL);
-  dt_action_define_iop(self, N_("calibrate"), N_("accept"),
-                       g->button_commit, &dt_action_def_button);
-  g_signal_connect(G_OBJECT(g->button_commit), "clicked",
-                   G_CALLBACK(_commit_profile_callback), (gpointer)self);
-  gtk_widget_set_tooltip_text(g->button_commit,
-                              _("accept the computed profile and set it in the module"));
+  g->button_commit = dtgtk_button_new_full(dtgtk_cairo_paint_check_mark, 0, NULL,
+      &(dtgtk_button_config_t){
+        .tooltip = _("accept the computed profile and set it in the module"),
+        .action = DT_ACTION(self),
+        .action_section = N_("calibrate"),
+        .action_label = N_("accept"),
+        .action_def = &dt_action_def_button,
+        .clicked_cb = G_CALLBACK(_commit_profile_callback),
+        .clicked_data = (gpointer)self,
+      });
 
-  g->button_profile = dtgtk_button_new(dtgtk_cairo_paint_refresh, 0, NULL);
-  dt_action_define_iop(self, N_("calibrate"), N_("recompute"),
-                       g->button_profile, &dt_action_def_button);
-  g_signal_connect(G_OBJECT(g->button_profile), "clicked",
-                   G_CALLBACK(_run_profile_callback), (gpointer)self);
-  gtk_widget_set_tooltip_text(g->button_profile, _("recompute the profile"));
+  g->button_profile = dtgtk_button_new_full(dtgtk_cairo_paint_refresh, 0, NULL,
+      &(dtgtk_button_config_t){
+        .tooltip = _("recompute the profile"),
+        .action = DT_ACTION(self),
+        .action_section = N_("calibrate"),
+        .action_label = N_("recompute"),
+        .action_def = &dt_action_def_button,
+        .clicked_cb = G_CALLBACK(_run_profile_callback),
+        .clicked_data = (gpointer)self,
+      });
 
-  g->button_validate = dtgtk_button_new(dtgtk_cairo_paint_softproof, 0, NULL);
-  dt_action_define_iop(self, N_("calibrate"), N_("validate"),
-                       g->button_validate, &dt_action_def_button);
-  g_signal_connect(G_OBJECT(g->button_validate), "clicked",
-                   G_CALLBACK(_run_validation_callback), (gpointer)self);
-  gtk_widget_set_tooltip_text(g->button_validate, _("check the output delta E"));
+  g->button_validate = dtgtk_button_new_full(dtgtk_cairo_paint_softproof, 0, NULL,
+      &(dtgtk_button_config_t){
+        .tooltip = _("check the output delta E"),
+        .action = DT_ACTION(self),
+        .action_section = N_("calibrate"),
+        .action_label = N_("validate"),
+        .action_def = &dt_action_def_button,
+        .clicked_cb = G_CALLBACK(_run_validation_callback),
+        .clicked_data = (gpointer)self,
+      });
 
   dt_gui_box_add(g->cs.container, g->checkers_list, g->optimize, g->safety,
                  g->label_delta_E, dt_gui_hbox(dt_gui_align_right(g->button_validate),
                  g->button_profile, g->button_commit));
+
+  DT_CONTROL_SIGNAL_CONNECT(DT_SIGNAL_ACTIVE_IMAGES_CHANGE,
+                            _dt_active_images_callback, g);
 }
 
 void gui_cleanup(dt_iop_module_t *self)
 {
+  dt_iop_channelmixer_rgb_gui_data_t *g = self->gui_data;
+  DT_CONTROL_SIGNAL_DISCONNECT(_dt_active_images_callback, g);
+
   if(self && self->dev)
   {
     dt_dev_chroma_t *chr = &self->dev->chroma;
     if(chr->adaptation == self)
       chr->adaptation = NULL;
   }
-
   self->request_color_pick = DT_REQUEST_COLORPICK_OFF;
 
-  dt_iop_channelmixer_rgb_gui_data_t *g = self->gui_data;
   dt_conf_set_int("plugins/darkroom/channelmixerrgb/gui_page",
                   gtk_notebook_get_current_page (g->notebook));
 

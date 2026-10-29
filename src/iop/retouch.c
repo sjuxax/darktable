@@ -714,11 +714,12 @@ static void rt_show_forms_for_current_scale(dt_iop_module_t *self)
       dt_masks_form_t *form = dt_masks_get_from_id(darktable.develop, formid);
       if(form)
       {
-        dt_masks_point_group_t *fpt = malloc(sizeof(dt_masks_point_group_t));
+        dt_masks_point_group_t *fpt = calloc(1, sizeof(dt_masks_point_group_t));
         fpt->formid = formid;
         fpt->parentid = grid;
         fpt->state = DT_MASKS_STATE_USE;
         fpt->opacity = 1.0f;
+        fpt->group_opacity = 1.0f;
         grp->points = g_list_append(grp->points, fpt);
       }
     }
@@ -938,7 +939,7 @@ static int rt_masks_get_transform_to_destination(dt_iop_module_t *self,
                                     form->source, dx, dy, distort_mode);
   }
 
-  if (angle)
+  if(angle)
     *angle = form->source[2];
 
   return res;
@@ -1817,9 +1818,10 @@ static void rt_edit_masks_callback(GtkGestureSingle *gesture,
     return;
   }
 
-  GdkEvent *event = gtk_get_current_event();
-  const guint button = event ? dt_gdk_event_get_button(event) : 0;
-  const GdkModifierType state = event ? dt_gdk_event_get_state(event) : 0;
+  /* for a shortcut-activated press dt_gui_current_button/state return the
+   * action effect's button/state, for a real click the event's */
+  const guint button = dt_gui_current_button(gesture);
+  const GdkModifierType state = dt_gui_current_state(gesture);
 
   dt_iop_gui_blend_data_t *bd = self->blend_data;
   dt_iop_retouch_gui_data_t *g = self->gui_data;
@@ -1886,8 +1888,6 @@ static void rt_edit_masks_callback(GtkGestureSingle *gesture,
 
     DT_LEAVE_GUI_UPDATE();
   }
-
-  if(event) gdk_event_free(event);
 }
 
 static void rt_add_shape_callback(GtkGestureSingle *gesture,
@@ -1904,13 +1904,8 @@ static void rt_add_shape_callback(GtkGestureSingle *gesture,
 
   dt_iop_color_picker_reset(self, TRUE);
 
-  gboolean creation_continuous = FALSE;
-  GdkEvent *event = gtk_get_current_event();
-  if(event)
-  {
-    creation_continuous = dt_modifier_is(dt_gdk_event_get_state(event), GDK_CONTROL_MASK);
-    gdk_event_free(event);
-  }
+  const gboolean creation_continuous =
+    dt_modifier_is(dt_gui_current_state(gesture), GDK_CONTROL_MASK);
 
   rt_add_shape(widget, creation_continuous, self);
 
@@ -1951,8 +1946,7 @@ static void rt_select_algorithm_callback(GtkGestureSingle *gesture,
   // check if we have to do something
   gboolean accept = TRUE;
 
-  GdkEvent *event = gtk_get_current_event();
-  const GdkModifierType state = event ? dt_gdk_event_get_state(event) : 0;
+  const GdkModifierType state = dt_gui_current_state(gesture);
 
   const int index = rt_get_selected_shape_index(p);
   if(index >= 0 && dt_modifier_is(state, GDK_CONTROL_MASK))
@@ -1989,10 +1983,7 @@ static void rt_select_algorithm_callback(GtkGestureSingle *gesture,
   rt_show_hide_controls(self);
 
   if(!accept)
-  {
-    if(event) gdk_event_free(event);
     return;
-  }
 
   if(index >= 0 && dt_modifier_is(state, GDK_CONTROL_MASK))
   {
@@ -2026,8 +2017,6 @@ static void rt_select_algorithm_callback(GtkGestureSingle *gesture,
     darktable.develop->form_gui->creation_module = self;
     dt_control_queue_redraw_center();
   }
-
-  if(event) gdk_event_free(event);
 
   dt_dev_add_history_item(darktable.develop, self, TRUE);
 
@@ -2656,7 +2645,7 @@ void gui_init(dt_iop_module_t *self)
      NULL);
   gtk_widget_set_tooltip_text(g->colorpicker, _("pick fill color from image"));
   dt_action_define_iop(self, NULL, N_("pick fill color"),
-                       g->colorpicker, &dt_action_def_toggle);
+                       g->colorpicker, &dt_action_def_color_picker);
 
   g->hbox_color_pick = dt_gui_hbox(dt_ui_label_new(_("fill color: ")),
                                    dt_gui_expand(g->colorpick), g->colorpicker);

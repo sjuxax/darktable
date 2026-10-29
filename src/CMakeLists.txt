@@ -22,6 +22,7 @@ FILE(GLOB SOURCE_FILES
   "common/atomic.c"
   "common/bilateral.c"
   "common/bilateralcl.c"
+  "common/bilinear.c"
   "common/box_filters.cc"
   "common/cache.c"
   "common/calculator.c"
@@ -49,15 +50,18 @@ FILE(GLOB SOURCE_FILES
   "common/exif.cc"
   "common/file_location.c"
   "common/film.c"
+  "common/filter.c"
   "common/gaussian.c"
   "common/gimp.c"
   "common/gpx.c"
   "common/grouping.c"
   "common/guided_filter.c"
+  "common/hdr_alignment.cc"
   "common/heal.c"
   "common/histogram.c"
   "common/history.c"
   "common/history_snapshot.c"
+  "common/dtdata.c"
   "common/image.c"
   "common/image_cache.c"
   "common/imagebuf.c"
@@ -88,6 +92,9 @@ FILE(GLOB SOURCE_FILES
   "common/ratings.c"
   "common/resource_limits.c"
   "common/selection.c"
+  "common/spektra_core.c"
+  "common/spektra_fetch.c"
+  "common/spektra_sim.c"
   "common/splines.cpp"
   "common/styles.c"
   "common/system_signal_handling.c"
@@ -110,6 +117,9 @@ FILE(GLOB SOURCE_FILES
   "control/signal.c"
   "develop/blend.c"
   "develop/blend_gui.c"
+  "develop/masks_gui_presets.c"
+  "develop/masks_gui_panel_host.c"
+  "develop/masks_gui_toolbar.c"
   "develop/blends/blendif_lab.c"
   "develop/blends/blendif_raw.c"
   "develop/blends/blendif_rgb_hsl.c"
@@ -121,14 +131,32 @@ FILE(GLOB SOURCE_FILES
   "develop/imageop_gui.c"
   "develop/imageop_math.c"
   "develop/lightroom.c"
+  "develop/masks/blend_blob.c"
   "develop/masks/brush.c"
+  "develop/masks/check.c"
   "develop/masks/circle.c"
   "develop/masks/ellipse.c"
   "develop/masks/gradient.c"
+  "develop/masks/object.c"
+  "develop/masks/pixel_mask.c"
   "develop/masks/group.c"
+  "develop/masks/harvest.c"
   "develop/masks/masks.c"
+  "develop/masks/migrate_legacy.c"
+  "develop/masks/parametric.c"
   "develop/masks/path.c"
+  "develop/masks/probe_image.c"
+  "develop/masks/raster.c"
+  "develop/masks/lockcheck.c"
+  "develop/masks/persist.c"
+  "develop/masks/postedit.c"
+  "develop/masks/roundtrip.c"
+  "develop/masks/scratch_image.c"
+  "develop/masks/styleapply.c"
+  "develop/masks/undo.c"
+  "develop/masks/verify.c"
   "develop/pixelpipe.c"
+  "develop/preview_data.c"
   "develop/tiling.c"
   "dtgtk/button.c"
   "dtgtk/culling.c"
@@ -139,6 +167,7 @@ FILE(GLOB SOURCE_FILES
   "dtgtk/paint.c"
   "dtgtk/paint_cell.c"
   "dtgtk/range.c"
+  "dtgtk/rating_stars.c"
   "dtgtk/resetlabel.c"
   "dtgtk/sidepanel.c"
   "dtgtk/stylemenu.c"
@@ -193,8 +222,6 @@ if(APPLE)
 endif(APPLE)
 
 if(WIN32)
-  list(APPEND SOURCE_FILES "win/strptime.c")
-  list(APPEND HEADER_FILES "win/strptime.h")
   list(APPEND SOURCE_FILES "win/statvfs.c")
   list(APPEND HEADER_FILES "win/statvfs.h")
 
@@ -232,7 +259,12 @@ if(WIN32)
   configure_file("${CMAKE_SOURCE_DIR}/data/pixmaps/dt_logo_128x128.ico" "${CMAKE_BINARY_DIR}/data/pixmaps/dt_logo_128x128.ico" COPYONLY)
   SET(CMAKE_RC_COMPILE_OBJECT "<CMAKE_RC_COMPILER> -O coff <DEFINES> -i <SOURCE> -o <OBJECT>")
   set(RESOURCE_OBJECT "${CMAKE_CURRENT_BINARY_DIR}/win/darktable.rc")
+  configure_file("${CMAKE_CURRENT_SOURCE_DIR}/win/darktable.exe.manifest"
+                 "${CMAKE_CURRENT_BINARY_DIR}/win/darktable.exe.manifest"
+                 COPYONLY)
   configure_file("${CMAKE_CURRENT_SOURCE_DIR}/win/darktable.rc.in" "${CMAKE_CURRENT_BINARY_DIR}/win/darktable.rc")
+  set_property(SOURCE "${RESOURCE_OBJECT}" APPEND PROPERTY OBJECT_DEPENDS
+               "${CMAKE_CURRENT_BINARY_DIR}/win/darktable.exe.manifest")
 endif(WIN32)
 
 set(SOURCES ${SOURCE_FILES} ${HEADER_FILES})
@@ -473,7 +505,6 @@ if(USE_AI)
     "common/ai/restore_rgb.c"
     "common/ai/restore_raw_bayer.c"
     "common/ai/restore_raw_linear.c"
-    "develop/masks/object.c"
     "gui/preferences_ai.c"
   )
   set(SOURCES ${SOURCES} ${SOURCE_FILES_AI})
@@ -496,29 +527,27 @@ endif()
 find_package(CURL 7.56 REQUIRED)
 list(APPEND LIBS CURL::libcurl)
 
-if(USE_AI)
-  # libarchive for AI model ZIP extraction
-  # On macOS with Homebrew, libarchive is keg-only
-  if(APPLE)
-    execute_process(
-      COMMAND brew --prefix libarchive
-      OUTPUT_VARIABLE HOMEBREW_LIBARCHIVE_PREFIX
-      OUTPUT_STRIP_TRAILING_WHITESPACE
-      ERROR_QUIET
-      RESULT_VARIABLE HOMEBREW_LIBARCHIVE_RESULT
-    )
-    if(HOMEBREW_LIBARCHIVE_RESULT EQUAL 0 AND EXISTS "${HOMEBREW_LIBARCHIVE_PREFIX}")
-      list(APPEND CMAKE_PREFIX_PATH "${HOMEBREW_LIBARCHIVE_PREFIX}")
-    endif()
+# libarchive for the .dtdata sidecar (common/dtdata.c) and AI model ZIP extraction
+# On macOS with Homebrew, libarchive is keg-only
+if(APPLE)
+  execute_process(
+    COMMAND brew --prefix libarchive
+    OUTPUT_VARIABLE HOMEBREW_LIBARCHIVE_PREFIX
+    OUTPUT_STRIP_TRAILING_WHITESPACE
+    ERROR_QUIET
+    RESULT_VARIABLE HOMEBREW_LIBARCHIVE_RESULT
+  )
+  if(HOMEBREW_LIBARCHIVE_RESULT EQUAL 0 AND EXISTS "${HOMEBREW_LIBARCHIVE_PREFIX}")
+    list(APPEND CMAKE_PREFIX_PATH "${HOMEBREW_LIBARCHIVE_PREFIX}")
   endif()
-  find_package(LibArchive)
-  if(NOT LibArchive_FOUND)
-    message(FATAL_ERROR "libarchive not found")
-  else()
-    include_directories(SYSTEM ${LibArchive_INCLUDE_DIRS})
-    list(APPEND LIBS ${LibArchive_LIBRARIES})
-  endif()
-endif(USE_AI)
+endif()
+find_package(LibArchive)
+if(NOT LibArchive_FOUND)
+  message(FATAL_ERROR "libarchive not found")
+else()
+  include_directories(SYSTEM ${LibArchive_INCLUDE_DIRS})
+  list(APPEND LIBS ${LibArchive_LIBRARIES})
+endif()
 
 # Require exiv2 >= 0.27.2 to make sure everything we need is available
 find_package(Exiv2 0.27.2 REQUIRED)
@@ -673,6 +702,71 @@ if(USE_GMIC)
   endif(GMIC_FOUND)
 endif(USE_GMIC)
 
+if(USE_OPENCV)
+  # Only these OpenCV modules are needed (the "bare minimum"):
+  #   core/imgproc        - image ops;
+  #   features2d/features - SIFT + FLANN matcher;
+  #   flann               - KD-tree index params;
+  #   calib3d/geometry    - findHomography / estimateAffine2D.
+  # OpenCV 5 reorganized the modules: features2d was renamed to features and
+  # calib3d was split into calib/geometry/stereo (the homography estimators we
+  # use landed in geometry). Both layouts are supported, hdr_alignment.cc picks
+  # its headers via CV_VERSION_MAJOR.
+  set(DT_OPENCV5_MODULES core imgproc features flann geometry)
+  set(DT_OPENCV4_MODULES core imgproc features2d flann calib3d)
+  # First try the standard config (custom builds, or distros shipping the
+  # unified OpenCVConfig.cmake).  QUIET: absence is fine, the HDR auto-alignment
+  # then compiles to a no-op (hdr_alignment.cc degrades to stubs without
+  # HAVE_OPENCV).
+  # OpenCVConfig-version.cmake only accepts requests whose major version matches
+  # the installed one, so 5 and 4 have to be probed separately.
+  find_package(OpenCV 5 COMPONENTS ${DT_OPENCV5_MODULES} QUIET)
+  if(OpenCV_FOUND)
+    set(DT_OPENCV_MODULES ${DT_OPENCV5_MODULES})
+  else()
+    find_package(OpenCV 4 COMPONENTS ${DT_OPENCV4_MODULES} QUIET)
+    set(DT_OPENCV_MODULES ${DT_OPENCV4_MODULES})
+  endif()
+  if(NOT OpenCV_FOUND)
+    # Fallback for distros (e.g. Debian/Ubuntu) that fragment OpenCV into
+    # per-module libopencv-<mod>-dev packages but keep OpenCVConfig.cmake only in
+    # the heavyweight libopencv-dev metapackage.  Discover the modules directly so
+    # users can install just the handful above instead of the whole library.
+    find_path(OpenCV_INCLUDE_DIRS NAMES opencv2/core.hpp PATH_SUFFIXES opencv4 opencv5)
+    if(OpenCV_INCLUDE_DIRS AND EXISTS "${OpenCV_INCLUDE_DIRS}/opencv2/core/version.hpp")
+      file(STRINGS "${OpenCV_INCLUDE_DIRS}/opencv2/core/version.hpp" _dt_cv_major
+           REGEX "CV_VERSION_MAJOR[ \t]+[0-9]+")
+      string(REGEX MATCH "[0-9]+" _dt_cv_major "${_dt_cv_major}")
+      if(_dt_cv_major GREATER_EQUAL 5)
+        set(DT_OPENCV_MODULES ${DT_OPENCV5_MODULES})
+      endif()
+      set(OpenCV_LIBS "")
+      set(_dt_opencv_ok TRUE)
+      foreach(_mod ${DT_OPENCV_MODULES})
+        find_library(DT_OPENCV_${_mod}_LIBRARY NAMES opencv_${_mod})
+        if(DT_OPENCV_${_mod}_LIBRARY)
+          list(APPEND OpenCV_LIBS ${DT_OPENCV_${_mod}_LIBRARY})
+        else()
+          set(_dt_opencv_ok FALSE)
+        endif()
+      endforeach()
+      if(_dt_opencv_ok AND _dt_cv_major GREATER_EQUAL 4)
+        set(OpenCV_FOUND TRUE)
+        set(OpenCV_VERSION "${_dt_cv_major}.x")
+        message(STATUS "OpenCV ${_dt_cv_major}.x found via per-module libraries")
+      endif()
+    endif()
+  endif()
+  if(OpenCV_FOUND)
+    add_definitions(-DHAVE_OPENCV)
+    include_directories(SYSTEM ${OpenCV_INCLUDE_DIRS})
+    list(APPEND LIBS ${OpenCV_LIBS})
+    message(STATUS "OpenCV ${OpenCV_VERSION}: HDR exposure-bracket auto-alignment enabled")
+  else()
+    message(STATUS "OpenCV not found: HDR exposure-bracket auto-alignment disabled")
+  endif(OpenCV_FOUND)
+endif(USE_OPENCV)
+
 if(USE_ICU)
   find_package(ICU COMPONENTS i18n data uc)
   if(ICU_FOUND)
@@ -719,7 +813,7 @@ if(NOT CUSTOM_CFLAGS)
   #-g MUST be set for ALL builds, or there will be no support for them when bugs happen
   set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} ${MARCH} -g")
   set(CMAKE_C_FLAGS_RELWITHDEBINFO "${CMAKE_C_FLAGS_RELWITHDEBINFO} -O2 -ftree-vectorize")
-  set(CMAKE_C_FLAGS_RELEASE "${CMAKE_C_FLAGS_RELEASE} -O3 -ffast-math -fno-finite-math-only")
+  set(CMAKE_C_FLAGS_RELEASE "${CMAKE_C_FLAGS_RELEASE} -O3 -ffast-math -fno-finite-math-only -D_DARKTABLE_RELEASE")
   if(CMAKE_C_COMPILER_ID STREQUAL "GNU")
     set(CMAKE_C_FLAGS_DEBUG "${CMAKE_C_FLAGS_DEBUG} -O0 -g3 -ggdb3")
     set(CMAKE_C_FLAGS_RELEASE "${CMAKE_C_FLAGS_RELEASE} -fexpensive-optimizations")
@@ -911,24 +1005,45 @@ if(USE_COLORD)
 endif(USE_COLORD)
 
 if(BUILD_PRINT)
-  find_package(Cups)
-  if(CUPS_FOUND)
-    include_directories(SYSTEM ${CUPS_INCLUDE_DIR})
-    FILE(GLOB SOURCE_FILES_PRINT
-      "common/cups_print.h"
-      "common/cups_print.c"
-      "common/printprof.c"
-      "common/printing.h"
-      "common/printing.c"
+  FILE(GLOB SOURCE_FILES_PRINT
+    "common/printprof.c"
+    "common/printing.h"
+    "common/printing.c"
+    "common/cups_print.h"
+    )
+  if(WIN32)
+    list(APPEND SOURCE_FILES_PRINT
+      "win/win32_print.c"
+      "win/win32_print.h"
       )
     set(SOURCES ${SOURCES} ${SOURCE_FILES_PRINT})
-    list(APPEND LIBS ${CUPS_LIBRARIES})
+    # Append Windows‑specific libraries to the common LIBS list
+    list(APPEND LIBS 
+      winspool
+      ole32
+      uuid
+      windowscodecs
+      oleaut32
+      prntvpt
+      )
     add_definitions("-DHAVE_PRINT")
-    message(STATUS "Print mode: enabled")
-  else(CUPS_FOUND)
-    set(BUILD_PRINT OFF)
-    message(STATUS "Print mode: disabled, please install CUPS dev package")
-  endif(CUPS_FOUND)
+    message(STATUS "Print mode: enabled (Windows)")
+  else(WIN32)
+    find_package(Cups)
+    if(CUPS_FOUND)
+      include_directories(SYSTEM ${CUPS_INCLUDE_DIR})
+      list(APPEND SOURCE_FILES_PRINT
+        "common/cups_print.c"
+        )
+      set(SOURCES ${SOURCES} ${SOURCE_FILES_PRINT})
+      list(APPEND LIBS ${CUPS_LIBRARIES})
+      add_definitions("-DHAVE_PRINT")
+        message(STATUS "Print mode: enabled (CUPS)")
+    else(CUPS_FOUND)
+      set(BUILD_PRINT OFF)
+      message(STATUS "Print mode: disabled, please install CUPS dev package")
+    endif(CUPS_FOUND)
+  endif(WIN32)
 else(BUILD_PRINT)
   message(STATUS "Print mode: disabled")
 endif(BUILD_PRINT)
@@ -1000,6 +1115,23 @@ add_custom_target(
   WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
 )
 
+# the masks panel's built-in group layout presets are read from JSON at
+# runtime; their strings are only extracted here, for translation
+add_custom_command(
+  DEPENDS ${CMAKE_SOURCE_DIR}/data/masks_group_presets.json
+          ${CMAKE_SOURCE_DIR}/tools/generate_masks_presets_strings.sh
+  OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/masks_group_presets_strings.h
+  COMMAND bash ${CMAKE_SOURCE_DIR}/tools/generate_masks_presets_strings.sh
+          ${CMAKE_SOURCE_DIR}/data/masks_group_presets.json
+          ${CMAKE_CURRENT_BINARY_DIR}/masks_group_presets_strings.h
+  COMMENT "Generating masks group preset strings for translation"
+)
+
+add_custom_target(
+  generate_masks_presets_strings ALL
+  DEPENDS ${CMAKE_CURRENT_BINARY_DIR}/masks_group_presets_strings.h
+)
+
 add_custom_target(
   generate_preferences ALL
   DEPENDS ${CMAKE_SOURCE_DIR}/tools/generate_prefs.xsl ${CMAKE_SOURCE_DIR}/data/darktableconfig.dtd ${DARKTABLE_DATADIR}/darktableconfig.xml ${CMAKE_CURRENT_BINARY_DIR}/preferences_gen.h
@@ -1017,11 +1149,46 @@ endif(USE_XMLLINT)
 #
 # build libdarktable
 #
+# common/spektra_core.h includes data/kernels/grain.h, the single copy
+# of the scalar math spektrafilm's CPU and OpenCL paths must agree on
+# bit-for-bit. The header has to live in data/kernels/ because that is the
+# only directory the OpenCL compiler searches, so the C side reaches across
+# rather than the other way round.
+include_directories("${CMAKE_SOURCE_DIR}/data/kernels")
+
 add_library(lib_darktable SHARED ${DARKTABLE_BINDIR}/preferences_gen.h ${DARKTABLE_BINDIR}/version_gen.c ${SOURCES})
 
 # cmake implicitly sets GENERATED on the source file in the directory of the custom command
 # since this isn't the same directory we do have to manually set it
 set_source_files_properties(${DARKTABLE_BINDIR}/version_gen.c PROPERTIES GENERATED TRUE)
+
+# spektrafilm's CPU path is required to reproduce its OpenCL twin bit-for-bit
+# (see grain_exp_neg in common/spektra_core.h and the FP_CONTRACT note at the top
+# of data/kernels/spektrafilm.cl). The "#pragma STDC FP_CONTRACT OFF" in that
+# header does not achieve this on GCC, which has never implemented the pragma
+# and happily emits vfmadd with it in force; -march=native then guarantees FMA
+# is available on any recent x86. Set the flag these files actually need.
+# Costs FMA in the per-pixel loops, buys a deterministic render across devices.
+check_c_compiler_flag("-ffp-contract=off" HAVE_FFP_CONTRACT_OFF)
+if(HAVE_FFP_CONTRACT_OFF)
+  set(SPEKTRA_FP_CONTRACT_FLAGS "-ffp-contract=off")
+  if(CMAKE_C_COMPILER_ID MATCHES "Clang")
+    # Clang errors out (-Woverriding-option, hard error since Clang 18) if
+    # -ffp-contract=off is requested while -ffast-math (or anything implying
+    # it, e.g. -Ofast) is also in effect for these files -- which can happen
+    # via CMAKE_C_FLAGS or a build-type default regardless of anything this
+    # file sets. Explicitly turn fast-math back off first so there is
+    # nothing left to "override". GCC needs no such workaround.
+    set(SPEKTRA_FP_CONTRACT_FLAGS "-fno-fast-math" "${SPEKTRA_FP_CONTRACT_FLAGS}")
+  endif()
+  set_source_files_properties(
+    "common/spektra_core.c"
+    "common/spektra_sim.c"
+    PROPERTIES COMPILE_OPTIONS "${SPEKTRA_FP_CONTRACT_FLAGS}")
+  # iop/spektrafilm.c is built in src/iop from its generated introspection
+  # copy, where a source property set here does not reach; the flags are
+  # applied to that target in src/iop/CMakeLists.txt.
+endif()
 
 add_dependencies(lib_darktable generate_styles_string)
 add_dependencies(lib_darktable generate_conf)
@@ -1093,6 +1260,11 @@ endif(HAVE_OPENCL)
 
 # have a command line interface
 add_subdirectory(cli)
+
+# have a Model Context Protocol server exposing the raw engine to AI agents
+if(USE_MCP)
+  add_subdirectory(mcp)
+endif()
 
 # have a command line utility to generate all the thumbnails
 add_subdirectory(generate-cache)

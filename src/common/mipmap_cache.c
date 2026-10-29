@@ -496,8 +496,9 @@ static void _mipmap_cache_allocate_dynamic(void *data,
     // dt_print(DT_DEBUG_ALWAYS, "[mipmap cache] alloc dynamic for key %u %p", key, *buf);
     if(!(entry->data))
     {
+      entry->data = (void *)_mipmap_cache_static_dead_image;
       dt_print(DT_DEBUG_ALWAYS, "[mipmap_cache] memory allocation failed!");
-      exit(1);
+      return;
     }
 
     dsc = entry->data;
@@ -961,6 +962,8 @@ void dt_mipmap_cache_get_with_caller(dt_mipmap_buffer_t *buf,
     // simple case: blocking get
     dt_cache_entry_t *entry =
       dt_cache_get_with_caller(&_get_cache(cache, mip)->cache, key, mode, file, line);
+    if(!entry)
+      return;
 
     ASAN_UNPOISON_MEMORY_REGION(entry->data, dt_mipmap_buffer_dsc_size);
 
@@ -983,6 +986,8 @@ void dt_mipmap_cache_get_with_caller(dt_mipmap_buffer_t *buf,
         dt_image_t DT_ALIGNED_ARRAY buffered_image;
         const dt_image_t *cimg = dt_image_cache_get(imgid, 'r');
         buffered_image = *cimg;
+        buffered_image.profile_hsm_data = NULL;
+        buffered_image.profile_hsm_data_size = buffered_image.profile_hsm_hue_div = buffered_image.profile_hsm_sat_div = buffered_image.profile_hsm_val_div = buffered_image.profile_hsm_encoding = 0;
         // dt_image_t *img = dt_image_cache_write_get(cimg);
         // dt_image_cache_write_release(img, DT_IMAGE_CACHE_RELAXED);
         dt_image_cache_read_release(cimg);
@@ -1007,6 +1012,18 @@ void dt_mipmap_cache_get_with_caller(dt_mipmap_buffer_t *buf,
         {
           // swap back new image data:
           dt_image_t *img = dt_image_cache_get(imgid, 'w');
+          if(buffered_image.profile_hsm_data)
+            g_free(img->profile_hsm_data);
+          else
+          {
+            // loaders that skip EXIF checks must not discard the cached table
+            buffered_image.profile_hsm_data = img->profile_hsm_data;
+            buffered_image.profile_hsm_data_size = img->profile_hsm_data_size;
+            buffered_image.profile_hsm_hue_div = img->profile_hsm_hue_div;
+            buffered_image.profile_hsm_sat_div = img->profile_hsm_sat_div;
+            buffered_image.profile_hsm_val_div = img->profile_hsm_val_div;
+            buffered_image.profile_hsm_encoding = img->profile_hsm_encoding;
+          }
           *img = buffered_image;
           img->load_status = DT_IMAGEIO_OK;
           // dt_print(DT_DEBUG_ALWAYS, "[mipmap read get] initializing full buffer img %u with %u %u -> %d %d (%p)",
@@ -1016,6 +1033,7 @@ void dt_mipmap_cache_get_with_caller(dt_mipmap_buffer_t *buf,
         }
         else
         {
+          g_free(buffered_image.profile_hsm_data);
           dt_print(DT_DEBUG_PIPE, "[mipmap read get] error loading ID=%d", imgid);
           //
           // we can only return a zero dimension buffer if the buffer
@@ -1069,6 +1087,9 @@ void dt_mipmap_cache_get_with_caller(dt_mipmap_buffer_t *buf,
       dt_cache_release(&_get_cache(cache, mip)->cache, entry);
       // get a read lock
       buf->cache_entry = entry = dt_cache_get(&_get_cache(cache, mip)->cache, key, mode);
+      if(!entry)
+        return;
+
       ASAN_UNPOISON_MEMORY_REGION(entry->data, dt_mipmap_buffer_dsc_size);
       entry->_lock_demoting = FALSE;
       dsc = (dt_mipmap_buffer_dsc_t *)buf->cache_entry->data;

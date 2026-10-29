@@ -20,6 +20,7 @@
 #include "common/interpolation.h"
 #include "common/math.h"
 #include "common/overlay.h"
+#include "common/utility.h"
 #include "control/control.h"
 #include "develop/develop.h"
 #include "develop/imageop.h"
@@ -33,7 +34,6 @@
 #include "gui/gtk.h"
 #include "iop/iop_api.h"
 
-#include <assert.h>
 #include <gtk/gtk.h>
 #include <inttypes.h>
 #include <stdlib.h>
@@ -325,7 +325,7 @@ static void _setup_overlay(dt_iop_module_t *self,
     {
       const gchar *tooltip = g_strdup_printf
         (_("overlay image missing from database\n\n"
-           "'%s'" ), p->filename);
+           "'%s'" ), data->filename);
       gtk_widget_set_tooltip_text(GTK_WIDGET(g->area), tooltip);
     }
   }
@@ -1099,8 +1099,7 @@ static gboolean _draw_thumb(GtkWidget *area,
     cairo_line_to(crf, width, 0.0);
     cairo_stroke(crf);
 
-    PangoFontDescription *desc =
-      pango_font_description_copy_static(darktable.bauhaus->pango_font_desc);
+    PangoFontDescription *desc = dt_gui_get_font();
     pango_font_description_set_weight(desc, PANGO_WEIGHT_BOLD);
     pango_font_description_set_absolute_size(desc, DT_PIXEL_APPLY_DPI(12) * PANGO_SCALE);
     PangoLayout *layout = pango_cairo_create_layout(crf);
@@ -1181,7 +1180,7 @@ int legacy_params(dt_iop_module_t *self,
     } dt_iop_overlay_params_v1_t;
 
     const dt_iop_overlay_params_v1_t *o = old_params;
-    dt_iop_overlay_params_t *n = malloc(sizeof(dt_iop_overlay_params_t));
+    dt_iop_overlay_params_t *n = calloc(1, sizeof(dt_iop_overlay_params_t));
 
     n->opacity = o->opacity;
     n->scale = o->scale;
@@ -1193,7 +1192,8 @@ int legacy_params(dt_iop_module_t *self,
     n->scale_img = o->scale_img;
     n->scale_svg = o->scale_svg;
     n->imgid = o->imgid;
-    g_strlcpy(n->filename, o->filename, sizeof(n->filename));
+    dt_strlcpy_fixed_to_fixed(n->filename, sizeof(n->filename),
+                              o->filename, sizeof(o->filename));
     n->compositing = DT_OVERLAY_COMPOSITE_LEGACY;
     n->dummy1 = 0;
     n->dummy2 = 0;
@@ -1225,7 +1225,9 @@ void commit_params(dt_iop_module_t *self,
   d->scale_svg  = p->scale_svg;
   d->imgid      = p->imgid;
   d->compositing = p->compositing;
-  g_strlcpy(d->filename, p->filename, sizeof(p->filename));
+  // stored params need not terminate the file name
+  dt_strlcpy_fixed_to_fixed(d->filename, sizeof(d->filename),
+                            p->filename, sizeof(p->filename));
 }
 
 void init_pipe(dt_iop_module_t *self,
@@ -1246,13 +1248,17 @@ void cleanup_pipe(dt_iop_module_t *self,
 void gui_update(dt_iop_module_t *self)
 {
   const dt_iop_overlay_gui_data_t *g = self->gui_data;
-  const dt_iop_overlay_params_t *p = self->params;
+  dt_iop_overlay_params_t *p = self->params;
+
+  // the GUI handlers read the stored file name as a C string
+  p->filename[sizeof(p->filename) - 1] = '\0';
 
   for(int i = 0; i < 9; i++)
   {
     gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(g->align[i]), FALSE);
   }
-  gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(g->align[p->alignment]), TRUE);
+  if(p->alignment >= 0 && p->alignment < 9)
+    gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(g->align[p->alignment]), TRUE);
 
   if(p->scale_base == DT_SCALE_MAINMENU_ADVANCED)
   {
@@ -1319,10 +1325,7 @@ void init_global(dt_iop_module_so_t *self)
 {
   dt_iop_overlay_global_data_t *gd = calloc(1, sizeof(dt_iop_overlay_global_data_t));
 
-  pthread_mutexattr_t recursive_locking;
-  pthread_mutexattr_init(&recursive_locking);
-  pthread_mutexattr_settype(&recursive_locking, PTHREAD_MUTEX_RECURSIVE);
-  dt_pthread_mutex_init(&gd->overlay_threadsafe, &recursive_locking);
+  dt_pthread_recursive_mutex_init(&gd->overlay_threadsafe);
 
 #ifdef HAVE_OPENCL
   const int program = 41; // overlay.cl

@@ -35,13 +35,6 @@
 #include <stdlib.h>
 #include <unistd.h>
 
-
-#ifdef _WIN32
-//MSVCRT does not have strptime implemented
-#include "win/strptime.h"
-#endif
-
-
 #ifdef USE_LUA
 #include "lua/call.h"
 #include "lua/events.h"
@@ -1201,7 +1194,10 @@ void dt_collection_split_operator_exposure(const gchar *input,
     gchar *inv = g_match_info_fetch(match_info, 1);
 
     if(strstr(inv, "1/") != NULL)
+    {
       *number1 = g_strdup_printf("1.0/%s", n1);
+      g_free(n1);
+    }
     else
       *number1 = n1;
     g_free(inv);
@@ -1210,7 +1206,10 @@ void dt_collection_split_operator_exposure(const gchar *input,
     inv = g_match_info_fetch(match_info, 4);
 
     if(strstr(inv, "1/") != NULL)
+    {
       *number2 = g_strdup_printf("1.0/%s", n2);
+      g_free(n2);
+    }
     else
       *number2 = n2;
     g_free(inv);
@@ -1236,7 +1235,10 @@ void dt_collection_split_operator_exposure(const gchar *input,
     gchar *inv = g_match_info_fetch(match_info, 2);
 
     if(strstr(inv, "1/") != NULL)
+    {
       *number1 = g_strdup_printf("1.0/%s", n1);
+      g_free(n1);
+    }
     else
       *number1 = n1;
     g_free(inv);
@@ -3313,6 +3315,7 @@ void dt_collection_history_save()
   // save current history
   dt_conf_set_string("plugins/lighttable/collect/history0", buf);
 }
+
 // clang-format off
 // modelines: These editor modelines have been set for all relevant files by tools/update_modelines.py
 // vim: shiftwidth=2 expandtab tabstop=2 cindent

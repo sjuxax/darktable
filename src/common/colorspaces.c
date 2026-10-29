@@ -18,6 +18,7 @@
 
 #include "common/colorspaces_inline_conversions.h"
 #include "common/colorspaces.h"
+#include "common/hdr-transfer.h"
 #include "common/colormatrices.c"
 #include "common/darktable.h"
 #include "common/debug.h"
@@ -638,10 +639,10 @@ cmsHPROFILE dt_colorspaces_create_darktable_profile(const char *makermodel)
 static cmsHPROFILE _colorspaces_create_xyz_profile(void)
 {
   cmsHPROFILE hXYZ = cmsCreateXYZProfile();
+  if(hXYZ == NULL) return NULL;
+
   cmsSetPCS(hXYZ, cmsSigXYZData);
   cmsSetHeaderRenderingIntent(hXYZ, INTENT_PERCEPTUAL);
-
-  if(hXYZ == NULL) return NULL;
 
   cmsSetProfileVersion(hXYZ, 2.1);
   cmsMLU *mlu0 = cmsMLUalloc(NULL, 1);
@@ -825,11 +826,19 @@ const dt_colorspaces_color_profile_t *dt_colorspaces_get_work_profile
     {
       // use introspection to get the profile name from the binary params blob
       const void *params = sqlite3_column_blob(stmt, 0);
+      const size_t params_size = sqlite3_column_bytes(stmt, 0);
       dt_colorspaces_color_profile_type_t *type = colorin->get_p(params, "type_work");
       char *filename = colorin->get_p(params, "filename_work");
+      const dt_introspection_field_t *f = colorin->get_f("filename_work");
 
-      if(type && filename) p = dt_colorspaces_get_profile(*type, filename,
-                                                          DT_PROFILE_DIRECTION_WORK);
+      // the blob comes from sidecars or the database unchecked: it may end
+      // before the file name, or not terminate it. type_work precedes the
+      // file name, so the same check keeps *type inside the blob
+      if(type && filename && f
+         && dt_util_blob_has_fixed_string(params, params_size,
+                                          f->header.offset, f->header.size))
+        p = dt_colorspaces_get_profile(*type, filename,
+                                       DT_PROFILE_DIRECTION_WORK);
     }
     sqlite3_finalize(stmt);
   }
@@ -892,10 +901,17 @@ const dt_colorspaces_color_profile_t *dt_colorspaces_get_output_profile
     {
       // use introspection to get the profile name from the binary params blob
       const void *params = sqlite3_column_blob(stmt, 0);
+      const size_t params_size = sqlite3_column_bytes(stmt, 0);
       dt_colorspaces_color_profile_type_t *type = colorout->get_p(params, "type");
       char *filename = colorout->get_p(params, "filename");
+      const dt_introspection_field_t *f = colorout->get_f("filename");
 
-      if(type && filename)
+      // the blob comes from sidecars or the database unchecked: it may end
+      // before the file name, or not terminate it. type precedes the file
+      // name, so the same check keeps *type inside the blob
+      if(type && filename && f
+         && dt_util_blob_has_fixed_string(params, params_size,
+                                          f->header.offset, f->header.size))
         p = dt_colorspaces_get_profile
           (*type, filename,
            DT_PROFILE_DIRECTION_OUT | DT_PROFILE_DIRECTION_DISPLAY);
@@ -932,7 +948,7 @@ static void dt_colorspaces_create_cmatrix(float cmatrix[4][3], float mat[3][3])
 }
 #endif
 
-static cmsHPROFILE dt_colorspaces_create_xyzmatrix_profile(const float mat[3][3])
+cmsHPROFILE dt_colorspaces_create_xyzmatrix_profile(const float mat[3][3])
 {
   // mat: cam -> xyz
   dt_aligned_pixel_t x, y;
@@ -1050,6 +1066,24 @@ void dt_colorspaces_cleanup_profile(cmsHPROFILE p)
   cmsCloseProfile(p);
 }
 
+cmsHPROFILE dt_colorspaces_linearize_profile(cmsHPROFILE profile)
+{
+  cmsHPROFILE linear = dt_colorspaces_make_temporary_profile(profile);
+  if(!linear) return NULL;
+  cmsToneCurve *trc = cmsBuildGamma(NULL, 1.0);
+  const gboolean valid = trc
+    && cmsWriteTag(linear, cmsSigRedTRCTag, trc)
+    && cmsWriteTag(linear, cmsSigGreenTRCTag, trc)
+    && cmsWriteTag(linear, cmsSigBlueTRCTag, trc);
+  cmsFreeToneCurve(trc);
+  if(!valid)
+  {
+    cmsCloseProfile(linear);
+    return NULL;
+  }
+  return linear;
+}
+
 cmsHPROFILE dt_colorspaces_make_temporary_profile(cmsHPROFILE profile)
 {
   cmsUInt32Number size;
@@ -1149,6 +1183,66 @@ static dt_colorspaces_color_profile_t *_create_profile
   return prof;
 }
 
+// the pipe encodes PQ and HLG with 1.0 at reference white (dt_hdr_encode()),
+// which no ICC shaper can express: the built-in PQ profile puts 1.0 at
+// 10000 nits and has no OOTF for HLG. so for those screens the thumbnail
+// transforms stop at linear light, and dt_colorspaces_transform_to_display()
+// does the encoding
+static cmsHTRANSFORM _create_display_transform(cmsHPROFILE from,
+                                               cmsHPROFILE display_profile,
+                                               const int hdr,
+                                               const dt_iop_color_intent_t intent)
+{
+  if(!hdr)
+    return cmsCreateTransform(from, TYPE_RGBA_8, display_profile, TYPE_BGRA_8,
+                              intent, 0);
+
+  cmsHPROFILE linear = dt_colorspaces_linearize_profile(display_profile);
+  if(!linear) return NULL;
+  cmsHTRANSFORM xform = cmsCreateTransform(from, TYPE_RGBA_8, linear, TYPE_RGBA_FLT,
+                                           intent, 0);
+  dt_colorspaces_cleanup_profile(linear);
+  return xform;
+}
+
+void dt_colorspaces_transform_to_display(cmsHTRANSFORM xform,
+                                         const int hdr,
+                                         const uint8_t *const in,
+                                         uint8_t *const out,
+                                         const int width,
+                                         const int height,
+                                         const size_t in_stride,
+                                         const size_t out_stride)
+{
+  if(!hdr)
+  {
+    DT_OMP_FOR()
+    for(int y = 0; y < height; y++)
+      cmsDoTransform(xform, in + y * in_stride, out + y * out_stride, width);
+    return;
+  }
+
+  size_t padded_size = 0;
+  float *scratchlines = dt_alloc_perthread_float(4 * width, &padded_size);
+  if(!scratchlines) return;
+  DT_OMP_FOR()
+  for(int y = 0; y < height; y++)
+  {
+    float *const line = dt_get_perthread(scratchlines, padded_size);
+    cmsDoTransform(xform, in + y * in_stride, line, width);
+    uint8_t *const o = out + y * out_stride;
+    for(int x = 0; x < width; x++)
+    {
+      float *const px = line + 4 * x;
+      dt_hdr_encode(px, hdr);
+      // cairo wants BGRA
+      for(int c = 0; c < 3; c++)
+        o[4 * x + 2 - c] = (uint8_t)(CLAMPF(px[c], 0.0f, 1.0f) * 255.0f + 0.5f);
+    }
+  }
+  dt_free_align(scratchlines);
+}
+
 // this function is basically thread safe, at least when not called on
 // the global darktable.color_profiles
 static void _update_display_transforms(dt_colorspaces_t *self)
@@ -1159,6 +1253,7 @@ static void _update_display_transforms(dt_colorspaces_t *self)
   if(self->transform_adobe_rgb_to_display)
     cmsDeleteTransform(self->transform_adobe_rgb_to_display);
   self->transform_adobe_rgb_to_display = NULL;
+  self->display_hdr_transfer = DT_HDR_NONE;
 
   const dt_colorspaces_color_profile_t *display_dt_profile =
     _get_profile(self,
@@ -1168,24 +1263,21 @@ static void _update_display_transforms(dt_colorspaces_t *self)
   if(!display_dt_profile) return;
   cmsHPROFILE display_profile = display_dt_profile->profile;
   if(!display_profile) return;
+  self->display_hdr_transfer = dt_colorspaces_hdr_transfer(display_dt_profile->type);
 
   self->transform_srgb_to_display =
-    cmsCreateTransform(_get_profile(self, DT_COLORSPACE_SRGB, "",
-                                    DT_PROFILE_DIRECTION_DISPLAY)->profile,
-                       TYPE_RGBA_8,
-                       display_profile,
-                       TYPE_BGRA_8,
-                       self->display_intent,
-                       0);
+    _create_display_transform(_get_profile(self, DT_COLORSPACE_SRGB, "",
+                                           DT_PROFILE_DIRECTION_DISPLAY)->profile,
+                              display_profile,
+                              self->display_hdr_transfer,
+                              self->display_intent);
 
   self->transform_adobe_rgb_to_display =
-    cmsCreateTransform(_get_profile(self, DT_COLORSPACE_ADOBERGB, "",
-                                    DT_PROFILE_DIRECTION_DISPLAY)->profile,
-                       TYPE_RGBA_8,
-                       display_profile,
-                       TYPE_BGRA_8,
-                       self->display_intent,
-                       0);
+    _create_display_transform(_get_profile(self, DT_COLORSPACE_ADOBERGB, "",
+                                           DT_PROFILE_DIRECTION_DISPLAY)->profile,
+                              display_profile,
+                              self->display_hdr_transfer,
+                              self->display_intent);
 }
 
 static void _update_display2_transforms(dt_colorspaces_t *self)
@@ -1197,6 +1289,7 @@ static void _update_display2_transforms(dt_colorspaces_t *self)
   if(self->transform_adobe_rgb_to_display2)
     cmsDeleteTransform(self->transform_adobe_rgb_to_display2);
   self->transform_adobe_rgb_to_display2 = NULL;
+  self->display2_hdr_transfer = DT_HDR_NONE;
 
   const dt_colorspaces_color_profile_t *display2_dt_profile
       = _get_profile(self,
@@ -1209,24 +1302,21 @@ static void _update_display2_transforms(dt_colorspaces_t *self)
   cmsHPROFILE display2_profile = display2_dt_profile->profile;
   if(!display2_profile)
     return;
+  self->display2_hdr_transfer = dt_colorspaces_hdr_transfer(display2_dt_profile->type);
 
   self->transform_srgb_to_display2
-      = cmsCreateTransform(_get_profile(self, DT_COLORSPACE_SRGB, "",
-                                        DT_PROFILE_DIRECTION_DISPLAY2)->profile,
-                           TYPE_RGBA_8,
-                           display2_profile,
-                           TYPE_BGRA_8,
-                           self->display2_intent,
-                           0);
+      = _create_display_transform(_get_profile(self, DT_COLORSPACE_SRGB, "",
+                                               DT_PROFILE_DIRECTION_DISPLAY2)->profile,
+                                  display2_profile,
+                                  self->display2_hdr_transfer,
+                                  self->display2_intent);
 
   self->transform_adobe_rgb_to_display2
-      = cmsCreateTransform(_get_profile(self, DT_COLORSPACE_ADOBERGB, "",
-                                        DT_PROFILE_DIRECTION_DISPLAY2)->profile,
-                           TYPE_RGBA_8,
-                           display2_profile,
-                           TYPE_BGRA_8,
-                           self->display2_intent,
-                           0);
+      = _create_display_transform(_get_profile(self, DT_COLORSPACE_ADOBERGB, "",
+                                               DT_PROFILE_DIRECTION_DISPLAY2)->profile,
+                                  display2_profile,
+                                  self->display2_hdr_transfer,
+                                  self->display2_intent);
 }
 
 // update cached transforms for color management of thumbnails
@@ -1819,6 +1909,10 @@ const char *dt_colorspaces_get_name(dt_colorspaces_color_profile_type_t type,
        return _("HLG P3");
      case DT_COLORSPACE_DISPLAY_P3:
        return _("Display P3");
+     case DT_COLORSPACE_FORWARD_MATRIX:
+       return _("DNG forward matrix");
+     case DT_COLORSPACE_DNG_LOOK:
+       return _("DNG embedded look");
      case DT_COLORSPACE_LAST:
        break;
   }
@@ -2049,7 +2143,13 @@ void dt_colorspaces_set_display_profile
   GtkWidget *widget = (profile_type == DT_COLORSPACE_DISPLAY2)
       ? darktable.develop->second_wnd
       : dt_ui_center(darktable.gui->ui);
-  GdkWindow *window = gtk_widget_get_window(widget);
+  // use the toplevel's window, which is already native. Calling
+  // gdk_win32_window_get_handle() on the center widget's client-side window
+  // makes GDK turn it into a native child window, which GDK then raises with
+  // SetForegroundWindow() whenever the center overlay is re-allocated
+  // (thumbnail hover, toasts, log messages), stealing the focus from other
+  // applications (#20442).
+  GdkWindow *window = gtk_widget_get_window(gtk_widget_get_toplevel(widget));
   HWND hwnd = (HWND)gdk_win32_window_get_handle(window);  // get window handle
   HMONITOR hMonitor = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST); // get monitor handle
   if(!hMonitor)
@@ -2612,6 +2712,7 @@ gboolean dt_colorspaces_profile_is_wide_gamut(const dt_colorspaces_color_profile
     case DT_COLORSPACE_PQ_P3:
     case DT_COLORSPACE_HLG_P3:
     case DT_COLORSPACE_DISPLAY_P3:
+    case DT_COLORSPACE_FORWARD_MATRIX:
       return TRUE;
 
     // sRGB primaries (gamma may differ but gamut is the same)
@@ -2630,6 +2731,7 @@ gboolean dt_colorspaces_profile_is_wide_gamut(const dt_colorspaces_color_profile
     case DT_COLORSPACE_DISPLAY2:
     case DT_COLORSPACE_EMBEDDED_ICC:
     case DT_COLORSPACE_EMBEDDED_MATRIX:
+    case DT_COLORSPACE_DNG_LOOK:
     case DT_COLORSPACE_STANDARD_MATRIX:
     case DT_COLORSPACE_ENHANCED_MATRIX:
     case DT_COLORSPACE_VENDOR_MATRIX:

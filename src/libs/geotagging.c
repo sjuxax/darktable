@@ -15,6 +15,7 @@
     You should have received a copy of the GNU General Public License
     along with darktable.  If not, see <http://www.gnu.org/licenses/>.
 */
+
 #include "common/gdk_event_utils.h"
 
 #include "common/debug.h"
@@ -31,9 +32,11 @@
 #include "gui/accelerators.h"
 #include "gui/gtk.h"
 #include "libs/lib_api.h"
+
 #ifdef HAVE_MAP
 #include "views/view.h"
 #endif
+
 #ifdef GDK_WINDOWING_QUARTZ
 #include "osx/osx.h"
 #endif
@@ -692,7 +695,7 @@ static void _show_gpx_tracks(dt_lib_module_t *self)
 
   GList *trkseg = dt_gpx_get_trkseg(d->map.gpx);
   d->map.nb_tracks = g_list_length(trkseg);
-  d->map.tracks = g_malloc0(sizeof(dt_lib_tracks_data_t) * d->map.nb_tracks);
+  d->map.tracks = g_try_malloc0(sizeof(dt_lib_tracks_data_t) * d->map.nb_tracks);
   if(!d->map.tracks)
   {
     d->map.nb_tracks = 0;
@@ -935,7 +938,7 @@ static void _setup_selected_images_list(dt_lib_module_t *self)
     dt_datetime_img_to_exif(dt, sizeof(dt), cimg);
     dt_image_cache_read_release(cimg);
 
-    dt_sel_img_t *img = g_malloc0(sizeof(dt_sel_img_t));
+    dt_sel_img_t *img = g_try_malloc0(sizeof(dt_sel_img_t));
     if(!img) continue;
     memcpy(img->dt, dt, DT_DATETIME_LENGTH);
     img->imgid = imgid;
@@ -1807,11 +1810,13 @@ void gui_init(dt_lib_module_t *self)
   box = _gui_init_datetime(_("original date/time"), &d->dt0, 1, self, group, NULL, NULL);
   gtk_grid_attach(grid, box, 0, line++, 4, 1);
 
-  d->lock_offset = dtgtk_togglebutton_new(dtgtk_cairo_paint_lock, 0, NULL);
-  gtk_widget_set_tooltip_text(d->lock_offset,
-                              _("lock date/time offset value to apply it onto another selection"));
+  d->lock_offset = dtgtk_togglebutton_new_full(dtgtk_cairo_paint_lock, 0, NULL,
+      &(dtgtk_button_config_t){
+        .tooltip = _("lock date/time offset value to apply it onto another selection"),
+        .clicked_cb = G_CALLBACK(_toggle_lock_button_callback),
+        .clicked_data = (gpointer)self,
+      });
   gtk_widget_set_halign(d->lock_offset, GTK_ALIGN_START);
-  g_signal_connect(G_OBJECT(d->lock_offset), "clicked", G_CALLBACK(_toggle_lock_button_callback), (gpointer)self);
 
   box = _gui_init_datetime(_("date/time offset"), &d->of, 2, self, group, d->lock_offset,
                            _("offset or difference ([-]dd hh:mm:ss[.sss])"));
@@ -1890,13 +1895,16 @@ void gui_init(dt_lib_module_t *self)
   label = dt_ui_section_label_new(C_("section", "GPX file"));
   gtk_grid_attach(grid, label, 0, line++, 4, 1);
 
-  d->map.gpx_button = dtgtk_button_new(dtgtk_cairo_paint_directory, CPF_NONE, NULL);
+  d->map.gpx_button = dtgtk_button_new_full(dtgtk_cairo_paint_directory, CPF_NONE, NULL,
+      &(dtgtk_button_config_t){
+        .tooltip = _("select a GPX track file..."),
+        .clicked_cb = G_CALLBACK(_choose_gpx_callback),
+        .clicked_data = self,
+      });
   gtk_widget_set_hexpand(d->map.gpx_button, FALSE);
   gtk_widget_set_halign(d->map.gpx_button, GTK_ALIGN_START);
   gtk_widget_set_name(d->map.gpx_button, "non-flat");
-  gtk_widget_set_tooltip_text(d->map.gpx_button, _("select a GPX track file..."));
   gtk_grid_attach(grid, d->map.gpx_button, 0, line, 1, 1);
-  g_signal_connect(G_OBJECT(d->map.gpx_button), "clicked", G_CALLBACK(_choose_gpx_callback), self);
 
   d->map.gpx_file = dt_ui_label_new("");
   gtk_label_set_ellipsize(GTK_LABEL(d->map.gpx_file ), PANGO_ELLIPSIZE_MIDDLE);

@@ -27,6 +27,7 @@
 #include "gui/accelerators.h"
 #include "gui/gtk.h"
 #include "iop/iop_api.h"
+
 #include <gtk/gtk.h>
 #include <stdlib.h>
 
@@ -340,13 +341,8 @@ static void _add_shape_callback(GtkGestureSingle *gesture,
   GtkWidget *widget = dt_gui_get_widget(gesture);
   const dt_iop_spots_gui_data_t *g = self->gui_data;
 
-  gboolean creation_continuous = FALSE;
-  GdkEvent *event = gtk_get_current_event();
-  if(event)
-  {
-    creation_continuous = dt_modifier_is(dt_gdk_event_get_state(event), GDK_CONTROL_MASK);
-    gdk_event_free(event);
-  }
+  const gboolean creation_continuous =
+    dt_modifier_is(dt_gui_current_state(gesture), GDK_CONTROL_MASK);
 
   _add_shape(widget, creation_continuous, self);
 
@@ -572,13 +568,13 @@ static int masks_get_delta(dt_iop_module_t *self,
   return res;
 }
 
-void _process(dt_iop_module_t *self,
-              dt_dev_pixelpipe_iop_t *piece,
-              const float *const in,
-              float *const out,
-              const dt_iop_roi_t *const roi_in,
-              const dt_iop_roi_t *const roi_out,
-              const int ch)
+static void _process(dt_iop_module_t *self,
+                     dt_dev_pixelpipe_iop_t *piece,
+                     const float *const in,
+                     float *const out,
+                     const dt_iop_roi_t *const roi_in,
+                     const dt_iop_roi_t *const roi_out,
+                     const int ch)
 {
   dt_iop_spots_params_t *d = piece->data;
   dt_develop_blend_params_t *bp = piece->blendop_data;

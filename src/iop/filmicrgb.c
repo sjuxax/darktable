@@ -15,6 +15,7 @@
    You should have received a copy of the GNU General Public License
    along with darktable.  If not, see <http://www.gnu.org/licenses/>.
 */
+
 #include "common/gdk_event_utils.h"
 
 /** Note :
@@ -53,7 +54,6 @@
 
 #include "gui/draw.h"
 
-#include <assert.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
@@ -983,7 +983,7 @@ static inline float filmic_spline(const float x, const dt_aligned_pixel_t M1, co
     }
     else
     {
-      // rational toe
+      // rational shoulder
       const float xi = x - latitude_max;
       const float rat = xi * (xi * M2[1] + 1.f);
       result = M4[1] + M1[1] * rat / (rat + M3[1]);
@@ -1060,12 +1060,12 @@ static inline gint mask_clipped_pixels(const float *const restrict in, float *co
     // any x > 4 will produce negligible changes over the image,
     // especially since we have reduced visual sensitivity in highlights.
     // so we discard pixels for argument > 4. for they are not worth computing.
-    clipped += (4.f > argument);
+    clipped += (4.f > argument) ? 1 : 0;
   }
   dt_mm_restore_flush_zero(oldMode);
 
   // If clipped area is < 9 pixels, recovery is not worth the computational cost, so skip it.
-  return (clipped > 9);
+  return clipped > 9;
 }
 
 
@@ -1079,13 +1079,19 @@ inline static void inpaint_noise(const float *const in, const float *const mask,
   // this creates "particules" in highlights, that will help the implicit partial derivative equation
   // solver used in wavelets reconstruction to generate texture
 
+  const uint32_t splitmix32_1337 = splitmix32(1337);
+  const uint32_t splitmix32_666 = splitmix32(666);
+
   DT_OMP_FOR(collapse(2))
   for(size_t i = 0; i < height; i++)
     for(size_t j = 0; j < width; j++)
     {
       // Init random number generator
       uint32_t DT_ALIGNED_ARRAY state[4]
-        = { splitmix32(j + 1), splitmix32((j + 1) * (i + 3)), splitmix32(1337), splitmix32(666) };
+        = { splitmix32(j + 1),
+            splitmix32((j + 1) * (i + 3)),
+            splitmix32_1337,
+            splitmix32_666 };
       xoshiro128plus(state);
       xoshiro128plus(state);
       xoshiro128plus(state);
@@ -1137,7 +1143,7 @@ inline static void wavelets_reconstruct_RGB(const float *const restrict HF, cons
     // channels
     const float grey_texture = fmaxabsf(fmaxabsf(TT_c[0], TT_c[1]), TT_c[2]);
 
-    // synthesize the max of all interpolated/inpainted RGB channels as a flat details term for the whole pixel
+    // synthesize the mean of all interpolated/inpainted RGB channels as a flat details term for the whole pixel
     // this is smoother than grey_texture and will fill holes smoothly in details layers if grey_texture ~= 0.f
     const float grey_details = (HF_c[0] + HF_c[1] + HF_c[2]) / 3.f;
 
@@ -1210,7 +1216,7 @@ static inline void wavelets_reconstruct_ratios(const float *const restrict HF,
     // channels
     const float grey_texture = fmaxabsf(fmaxabsf(TT_c[0], TT_c[1]), TT_c[2]);
 
-    // synthesize the max of all interpolated/inpainted RGB channels as a flat details term for the whole pixel
+    // synthesize the mean of all interpolated/inpainted RGB channels as a flat details term for the whole pixel
     // this is smoother than grey_texture and will fill holes smoothly in details layers if grey_texture ~= 0.f
     const float grey_details = (HF_c[0] + HF_c[1] + HF_c[2]) / 3.f;
 
@@ -2063,15 +2069,15 @@ void tiling_callback(dt_iop_module_t *self, dt_dev_pixelpipe_iop_t *piece,
 {
   const int scales = get_scales(roi_in, piece);
   const int max_filter_radius = (1 << scales);
-  const dt_iop_filmicrgb_data_t *const data = piece->data;
-  const gboolean run_fast = !data->enable_highlight_reconstruction || dt_pipe_is_fast(piece->pipe);
+  const dt_iop_filmicrgb_data_t *const d = piece->data;
+  const gboolean run_fast = !d->enable_highlight_reconstruction || dt_pipe_is_fast(piece->pipe);
 
   // without reconstruction: in + out + 1ch_mask
   // with reconstruction: in + out + reconst + inpaint + 2 * scales + temp + 1ch_mask
   // with HQ reconstruction: in + out + reconst + inpaint + tmp + 2 * scales + temp + ratios + 1ch_mask + 1ch_norms
-  const float hq = data->high_quality_reconstruction > 0 ? 1.25f : 0.0f;
+  const float hq = d->high_quality_reconstruction > 0 ? 1.25f : 0.0f;
   tiling->factor = run_fast ? 2.25f : (7.25f + hq);
-  tiling->factor_cl = run_fast ? 9.0f : 9.0f;
+  tiling->factor_cl = run_fast ? 2.25f : 10.25 ;
 
   tiling->maxbuf = 1.0f;
   tiling->maxbuf_cl = 1.0f;
@@ -2121,7 +2127,10 @@ void process(dt_iop_module_t *self,
   {
     const dt_iop_filmicrgb_gui_data_t *g = self->gui_data;
 
-    if(g->show_mask)
+    dt_iop_gui_enter_critical_section(self);
+    const gboolean show_mask = g->show_mask;
+    dt_iop_gui_leave_critical_section(self);
+    if(show_mask)
     {
       display_mask(mask, out, roi_out->width, roi_out->height);
       dt_free_align(mask);
@@ -2245,8 +2254,8 @@ static inline cl_int reconstruct_highlights_cl(const cl_mem in, const cl_mem mas
 
   // alloc a permanent reusable buffer for intermediate computations - avoid multiple alloc/free
   const cl_mem temp = dt_opencl_alloc_device(devid, sizes[0], sizes[1], sizeof(float) * 4);;
-
-  if(!LF_even || !LF_odd || !HF_RGB || !HF_grey || !temp)
+  const cl_mem reconstructed_temp = dt_opencl_alloc_device(devid, sizes[0], sizes[1], sizeof(float) * 4);
+  if(!LF_even || !LF_odd || !HF_RGB || !HF_grey || !temp || !reconstructed_temp)
   {
     dt_control_log(_("filmic highlights reconstruction failed to allocate memory on GPU"));
     err = CL_MEM_OBJECT_ALLOCATION_FAILURE;
@@ -2275,6 +2284,11 @@ static inline cl_int reconstruct_highlights_cl(const cl_mem in, const cl_mem mas
   // the wavelets decomposition here is the same as the equalizer/atrous module,
   // but simplified because we don't need the edge-aware term, so we can separate the convolution kernel
   // with a vertical and horizontal blur, which is 10 multiply-add instead of 25 by pixel.
+
+  // We must ping-pong the reconstructed data for OpenCL 1.2 specs
+  cl_mem reconstructed_in = reconstructed;
+  cl_mem reconstructed_out = reconstructed_temp;
+
   for(int s = 0; s < scales; ++s)
   {
     cl_mem detail;
@@ -2335,11 +2349,18 @@ static inline cl_int reconstruct_highlights_cl(const cl_mem in, const cl_mem mas
     // Reconstruct clipped parts
     err = dt_opencl_enqueue_kernel_2d_args(devid, gd->kernel_filmic_wavelets_reconstruct, width, height,
       CLARG(HF_RGB), CLARG(LF),
-      CLARG(HF_grey), CLARG(mask), CLARG(reconstructed), CLARG(reconstructed), CLARG(width), CLARG(height),
+      CLARG(HF_grey), CLARG(mask), CLARG(reconstructed_in), CLARG(reconstructed_out), CLARG(width), CLARG(height),
       CLARG(gamma), CLARG(gamma_comp), CLARG(beta), CLARG(beta_comp), CLARG(delta), CLARG(s), CLARG(scales),
       CLARG(variant));
     if(err != CL_SUCCESS) goto error;
+
+    cl_mem swap_tmp = reconstructed_in;
+    reconstructed_in = reconstructed_out;
+    reconstructed_out = swap_tmp;
   }
+
+  if(reconstructed_in != reconstructed)
+    err = dt_opencl_enqueue_copy_image(devid, reconstructed_in, reconstructed, CLIMG_ORIGIN, CLIMG_ORIGIN, sizes);
 
 error:
   dt_opencl_release_mem_object(temp);
@@ -2347,6 +2368,7 @@ error:
   dt_opencl_release_mem_object(LF_odd);
   dt_opencl_release_mem_object(HF_RGB);
   dt_opencl_release_mem_object(HF_grey);
+  dt_opencl_release_mem_object(reconstructed_temp);
   return err;
 }
 
@@ -2431,9 +2453,9 @@ int process_cl(dt_iop_module_t *self,
   // used to adjust noise level depending on size. Don't amplify noise if magnified > 100%
   const float scale = MAX(piece->iscale / roi_in->scale, 1.f);
 
-  uint32_t is_clipped = 0;
-  clipped = dt_opencl_alloc_device_buffer(devid, sizeof(uint32_t));
-  err = dt_opencl_write_buffer_to_device(devid, &is_clipped, clipped, 0, sizeof(uint16_t), TRUE);
+  int cnt_clipped = 0;
+  clipped = dt_opencl_alloc_device_buffer(devid, sizeof(cnt_clipped));
+  err = dt_opencl_write_buffer_to_device(devid, &cnt_clipped, clipped, 0, sizeof(cnt_clipped), TRUE);
   if(err != CL_SUCCESS) goto error;
 
   // build a mask of clipped pixels
@@ -2444,7 +2466,7 @@ int process_cl(dt_iop_module_t *self,
   if(err != CL_SUCCESS) goto error;
 
   // check for clipped pixels
-  err = dt_opencl_read_buffer_from_device(devid, &is_clipped, clipped, 0, sizeof(uint32_t), TRUE);
+  err = dt_opencl_read_buffer_from_device(devid, &cnt_clipped, clipped, 0, sizeof(cnt_clipped), TRUE);
   if(err != CL_SUCCESS) goto error;
   dt_opencl_release_mem_object(clipped);
   clipped = NULL;
@@ -2453,20 +2475,21 @@ int process_cl(dt_iop_module_t *self,
   if(self->dev->gui_attached && dt_pipe_is_full(piece->pipe))
   {
     const dt_iop_filmicrgb_gui_data_t *g = self->gui_data;
+    dt_iop_gui_enter_critical_section(self);
+    const gboolean show_mask = g->show_mask;
+    dt_iop_gui_leave_critical_section(self);
 
-    if(g->show_mask)
+    if(show_mask)
     {
       err = dt_opencl_enqueue_kernel_2d_args(devid, gd->kernel_filmic_show_mask, width, height,
         CLARG(mask), CLARG(dev_out), CLARG(width), CLARG(height));
-      dt_opencl_release_mem_object(mask);
-      dt_ioppr_free_iccprofile_params_cl(&profile_info_cl, &profile_lut_cl, &dev_profile_info, &dev_profile_lut);
-      return err;
+      goto error;
     }
   }
 
   const gboolean run_fast = dt_pipe_is_fast(piece->pipe);
 
-  if(!run_fast && is_clipped > 0 && d->enable_highlight_reconstruction)
+  if(!run_fast && cnt_clipped > 9 && d->enable_highlight_reconstruction)
   {
     // Inpaint noise
     const float noise_level = d->noise_level / scale;
@@ -2718,12 +2741,16 @@ static void show_mask_callback(GtkGestureSingle *gesture,
                                 int n_press,
                                 double x,
                                 double y,
-                                const dt_iop_module_t *self)
+                                dt_iop_module_t *self)
 {
   DT_TRY_GUI_UPDATE();
   dt_iop_filmicrgb_gui_data_t *g = self->gui_data;
+  dt_iop_gui_enter_critical_section(self);
   g->show_mask = !(g->show_mask);
-  gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(g->show_highlight_mask), g->show_mask);
+  const gboolean show_mask = g->show_mask;
+  dt_iop_gui_leave_critical_section(self);
+
+  gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(g->show_highlight_mask), show_mask);
   DT_LEAVE_GUI_UPDATE();
   dt_dev_reprocess_center(self->dev, self->iop_order);
 }
@@ -3113,10 +3140,13 @@ void gui_focus(dt_iop_module_t *self, gboolean in)
   if(!in)
   {
     // lost focus - hide the mask
-    const gint mask_was_shown = g->show_mask;
+    dt_iop_gui_enter_critical_section(self);
+    const gboolean show_mask = g->show_mask;
     g->show_mask = FALSE;
+    dt_iop_gui_leave_critical_section(self);
+
     gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(g->show_highlight_mask), FALSE);
-    if(mask_was_shown) dt_dev_reprocess_center(self->dev, self->iop_order);
+    if(show_mask) dt_dev_reprocess_center(self->dev, self->iop_order);
   }
 }
 
@@ -3287,24 +3317,10 @@ void filmic_gui_draw_icon(cairo_t *cr, const dt_iop_filmicrgb_gui_button_data_t 
 
   cairo_save(cr);
 
-  GdkRGBA color;
-
-  // copy color
-  color.red = darktable.bauhaus->graph_fg.red;
-  color.green = darktable.bauhaus->graph_fg.green;
-  color.blue = darktable.bauhaus->graph_fg.blue;
-  color.alpha = darktable.bauhaus->graph_fg.alpha;
-
   if(button->mouse_hover)
-  {
-    // use graph_fg color as-is if mouse hover
-    cairo_set_source_rgba(cr, color.red, color.green, color.blue, color.alpha);
-  }
+    set_color(cr, darktable.bauhaus->color_fg);
   else
-  {
-    // use graph_fg color with transparency else
-    cairo_set_source_rgba(cr, color.red, color.green, color.blue, color.alpha * 0.5);
-  }
+    set_color(cr, darktable.bauhaus->color_fg_insensitive);
 
   cairo_rectangle(cr, button->left, button->top, button->w - DT_PIXEL_APPLY_DPI(0.5),
                   button->h - DT_PIXEL_APPLY_DPI(0.5));
@@ -3332,8 +3348,7 @@ static gboolean dt_iop_tonecurve_draw(GtkWidget *widget, cairo_t *crf, dt_iop_mo
 
   cairo_surface_t *cst =
     dt_cairo_image_surface_create(CAIRO_FORMAT_ARGB32, g->allocation.width, g->allocation.height);
-  PangoFontDescription *desc =
-    pango_font_description_copy_static(darktable.bauhaus->pango_font_desc);
+  PangoFontDescription *desc = dt_gui_get_font();
   cairo_t *cr = cairo_create(cst);
   PangoLayout *layout = pango_cairo_create_layout(cr);
 

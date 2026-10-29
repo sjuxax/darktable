@@ -15,6 +15,7 @@
     You should have received a copy of the GNU General Public License
     along with darktable.  If not, see <http://www.gnu.org/licenses/>.
 */
+
 #include "common/gdk_event_utils.h"
 
 #include "bauhaus/bauhaus.h"
@@ -1480,7 +1481,7 @@ static cl_int_t _apply_global_distortion_map_cl(const dt_iop_module_t *self,
        kdesc.size = 2;
        k = malloc(sizeof(float) * ((size_t)kdesc.size * kdesc.resolution + 1));
        for(int i = 0; i <= kdesc.size * kdesc.resolution; ++i)
-         k[i] = bicubic(0.5f, (float) i / kdesc.resolution);
+         k[i] = bicubic(-0.5f, (float) i / kdesc.resolution);
        break;
      case DT_INTERPOLATION_LANCZOS2:
        kdesc.size = 2;
@@ -2198,11 +2199,11 @@ static void casteljau(const float complex *p0,
     hit->elem = data;                   \
   }
 
-void _hit_paths(dt_iop_module_t *self,
-                dt_iop_liquify_params_t *p,
-                const GList *layers,
-                const float complex *pt,
-                dt_liquify_hit_t *hit)
+static void _hit_paths(dt_iop_module_t *self,
+                       dt_iop_liquify_params_t *p,
+                       const GList *layers,
+                       const float complex *pt,
+                       dt_liquify_hit_t *hit)
 {
   float distance = FLT_MAX;
 
@@ -2351,10 +2352,10 @@ static void draw_paths(const dt_iop_module_t *self,
   g_list_free(layers);
 }
 
-void _hit_test_paths(dt_iop_module_t *self,
-                     dt_iop_liquify_params_t *params,
-                     const float complex pt,
-                     dt_liquify_hit_t *hit)
+static void _hit_test_paths(dt_iop_module_t *self,
+                            dt_iop_liquify_params_t *params,
+                            const float complex pt,
+                            dt_liquify_hit_t *hit)
 {
   GList *layers = NULL;
 
@@ -3581,8 +3582,6 @@ static void _btn_make_radio_cb(GtkToggleButton *btn,
     gtk_toggle_button_set_active(g->btn_curve_tool, btn == g->btn_curve_tool);
     gtk_toggle_button_set_active(g->btn_node_tool,  btn == g->btn_node_tool);
 
-    gtk_toggle_button_set_active(g->btn_node_tool,  btn == g->btn_node_tool);
-
     dt_liquify_layers[DT_LIQUIFY_LAYER_BACKGROUND].hint
         = btn == g->btn_point_tool
         ? _("<b>add point</b>: click and drag\n<b>size</b>: scroll - "
@@ -3620,13 +3619,13 @@ static void btn_make_radio_callback(GtkGestureSingle *gesture,
                                       double y,
                                       dt_iop_module_t *self)
 {
-  GdkEvent *event = gtk_get_current_event();
-  gboolean ctrl_pressed = FALSE;
-  if(event)
-  {
-    ctrl_pressed = dt_modifier_is(dt_gdk_event_get_state(event), GDK_CONTROL_MASK);
-    gdk_event_free(event);
-  }
+  /* read the modifier state from the gesture: for a real click this is
+   * the live event state, for a shortcut-activated press it is the
+   * declared effect carried by _action_effect_button_state() (see
+   * DT_ACTION_GESTURE_SYNTH_KEY in gtk.h); gtk_get_current_event() would
+   * return the key event during shortcut dispatch and lose the declared
+   * ctrl variant */
+  const gboolean ctrl_pressed = dt_modifier_is(dt_gui_current_state(gesture), GDK_CONTROL_MASK);
 
   GtkWidget *btn = dt_gui_get_widget(gesture);
 

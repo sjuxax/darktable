@@ -145,7 +145,6 @@ if(WIN32)
   set(USE_COLORD OFF)
   set(USE_KWALLET OFF)
   set(BUILD_CMSTEST OFF)
-  set(BUILD_PRINT OFF)
   set(TESTBUILD_OPENCL_PROGRAMS OFF)
   if(BUILD_MSYS2_INSTALL)
     add_definitions(-DMSYS2_INSTALL)
@@ -286,6 +285,9 @@ endif(VALIDATE_APPDATA_FILE)
 if(TESTBUILD_OPENCL_PROGRAMS)
   set(TESTBUILD_OPENCL_PROGRAMS OFF)
 
+  # LLVM's Findzstd.cmake defines only some of zstd's targets, which makes a
+  # later find_package(zstd CONFIG) (via OpenEXR) fail; define them all first
+  find_package(zstd CONFIG QUIET)
   find_package(LLVM CONFIG)
 
   if(LLVM_FOUND)
@@ -428,6 +430,15 @@ endif()
 
 if(BUILD_TESTING)
   find_package(cmocka 1.1.0 CONFIG REQUIRED)
+  # cmocka 1.x's config exports a bare "cmocka" target; 2.x exports only the
+  # namespaced "cmocka::cmocka". Alias one to the other so test CMakeLists can
+  # name either and build against both versions -- without this, every
+  # add_cmocka_test() saying plain "cmocka" fails to link on cmocka 2.x.
+  if(TARGET cmocka::cmocka AND NOT TARGET cmocka)
+    add_library(cmocka ALIAS cmocka::cmocka)
+  elseif(TARGET cmocka AND NOT TARGET cmocka::cmocka)
+    add_library(cmocka::cmocka ALIAS cmocka)
+  endif()
   include(AddCMockaTest)
   include(AddCMockaMockTest)
   include_directories(${CMOCKA_INCLUDE_DIR} include)

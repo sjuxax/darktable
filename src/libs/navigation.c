@@ -15,6 +15,7 @@
     You should have received a copy of the GNU General Public License
     along with darktable.  If not, see <http://www.gnu.org/licenses/>.
 */
+
 #include "common/gdk_event_utils.h"
 
 #include "bauhaus/bauhaus.h"
@@ -455,11 +456,11 @@ static gboolean _lib_navigation_draw_callback(GtkWidget *widget,
   return FALSE;
 }
 
-void _lib_navigation_set_position(dt_lib_module_t *self,
-                                  const double x,
-                                  const double y,
-                                  const int wd,
-                                  const int ht)
+static void _lib_navigation_set_position(dt_lib_module_t *self,
+                                         const double x,
+                                         const double y,
+                                         const int wd,
+                                         const int ht)
 {
   dt_lib_navigation_t *d = self->data;
 
@@ -591,10 +592,10 @@ static void _lib_navigation_scroll_callback(GtkEventControllerScroll *controller
                                             // FIXME: if unused don't pass
                                             dt_lib_module_t *self)
 {
-  GdkEvent *event = gtk_get_current_event();
+  GdkEvent *event = dt_gui_get_current_event(GTK_EVENT_CONTROLLER(controller));
   if(event)
   {
-    GdkDevice *device = gdk_event_get_source_device(event);
+    GdkDevice *device = dt_gdk_event_get_source_device(event);
     if(device
        && gdk_device_get_source(device) == GDK_SOURCE_TOUCHPAD
        && dt_gdk_event_get_scroll_direction(event) == GDK_SCROLL_SMOOTH)
@@ -610,14 +611,16 @@ static void _lib_navigation_scroll_callback(GtkEventControllerScroll *controller
                                           dt_gdk_event_get_x(event), dt_gdk_event_get_y(event),
                                           &x, &y))
       {
-        const double delta = fabs(dx) > fabs(dy) ? -dx : dy;
-        const int zoom_in = delta < 0.0 ? 1 : 0;
+        const gboolean zoom_in = dt_gui_scroll_zoom_delta(event,
+                                                          dx, dy) > 0.0f;
 
         dt_dev_zoom_move(&darktable.develop->full, DT_ZOOM_SCROLL,
-                         0.0f, zoom_in, x, y, constrain);
+                         0.0f, zoom_in ? 1 : 0, x, y, constrain);
       }
     }
+#if !GTK_CHECK_VERSION(4, 0, 0)
     gdk_event_free(event);
+#endif
   }
 }
 

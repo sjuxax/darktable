@@ -18,6 +18,7 @@
 
 #include "bauhaus/bauhaus.h"
 #include "common/colorspaces.h"
+#include "common/hdr-transfer.h"
 #include "common/colorspaces_inline_conversions.h"
 #include "common/dttypes.h"
 #include "common/imagebuf.h"
@@ -33,7 +34,6 @@
 #include "gui/gtk.h"
 #include "iop/iop_api.h"
 
-#include <assert.h>
 #include <gdk/gdkkeysyms.h>
 #include <math.h>
 #include <stdlib.h>
@@ -50,6 +50,7 @@ typedef struct dt_iop_colorout_data_t
 {
   dt_colorspaces_color_profile_type_t type;
   dt_colorspaces_color_mode_t mode;
+  int hdr_transfer;
   float lut[3][LUT_SAMPLES];
   dt_colormatrix_t cmatrix;
   cmsHTRANSFORM *xform;
@@ -188,7 +189,8 @@ int legacy_params(dt_iop_module_t *self,
     else
     {
       n->type = DT_COLORSPACE_FILE;
-      dt_strlcpy_to_fixed(n->filename, o->iccprofile, sizeof(n->filename));
+      dt_strlcpy_fixed_to_fixed(n->filename, sizeof(n->filename),
+                                o->iccprofile, sizeof(o->iccprofile));
     }
 
     n->intent = o->intent;
@@ -213,7 +215,8 @@ int legacy_params(dt_iop_module_t *self,
     memset(n, 0, sizeof(dt_iop_colorout_params_v5_t));
 
     n->type = o->type;
-    dt_strlcpy_to_fixed(n->filename, o->filename, sizeof(n->filename));
+    dt_strlcpy_fixed_to_fixed(n->filename, sizeof(n->filename),
+                              o->filename, sizeof(o->filename));
     n->intent = o->intent;
 
     *new_params = n;
@@ -345,7 +348,7 @@ int process_cl(dt_iop_module_t *self, dt_dev_pixelpipe_iop_t *piece, cl_mem dev_
   if(dev_coeffs == NULL) goto error;
   err = dt_opencl_enqueue_kernel_2d_args(devid, gd->kernel_colorout, width, height,
     CLARG(dev_in), CLARG(dev_out), CLARG(width), CLARG(height), CLARG(dev_m), CLARG(dev_r), CLARG(dev_g),
-    CLARG(dev_b), CLARG(dev_coeffs));
+    CLARG(dev_b), CLARG(dev_coeffs), CLARG(d->hdr_transfer));
 
 error:
   dt_opencl_release_mem_object(dev_m);
@@ -543,6 +546,12 @@ void process(dt_iop_module_t *self, dt_dev_pixelpipe_iop_t *piece, const void *c
   {
     _transform_lcms(d, out, (float*)ivoid, npixels);
   }
+  if(d->hdr_transfer)
+  {
+    DT_OMP_FOR()
+    for(size_t k = 0; k < npixels; k++)
+      dt_hdr_encode(out + 4*k, d->hdr_transfer);
+  }
 }
 
 void commit_params(dt_iop_module_t *self, dt_iop_params_t *p1, dt_dev_pixelpipe_t *pipe,
@@ -550,6 +559,9 @@ void commit_params(dt_iop_module_t *self, dt_iop_params_t *p1, dt_dev_pixelpipe_
 {
   dt_iop_colorout_params_t *p = (dt_iop_colorout_params_t *)p1;
   dt_iop_colorout_data_t *d = piece->data;
+
+  // stored params need not terminate the file name
+  p->filename[sizeof(p->filename) - 1] = '\0';
 
   d->type = p->type;
 
@@ -566,6 +578,7 @@ void commit_params(dt_iop_module_t *self, dt_iop_params_t *p1, dt_dev_pixelpipe_
 
   cmsHPROFILE output = NULL;
   cmsHPROFILE softproof = NULL;
+  cmsHPROFILE hdr_linear = NULL;
   cmsUInt32Number output_format = TYPE_RGBA_FLT;
 
   d->mode = dt_pipe_is_full(pipe) ? darktable.color_profiles->mode : DT_PROFILE_NORMAL;
@@ -619,6 +632,7 @@ void commit_params(dt_iop_module_t *self, dt_iop_params_t *p1, dt_dev_pixelpipe_
   // when the output type is Lab then process is a nop, so we can avoid creating a transform
   // and the subsequent error messages but still have to publish the profile_info
   d->type = out_type;
+  d->hdr_transfer = dt_colorspaces_hdr_transfer(out_type);
   if(out_type == DT_COLORSPACE_LAB)
   {
     dt_ioppr_set_pipe_output_profile_info(self->dev, piece->pipe, d->type, out_filename, p->intent);
@@ -694,6 +708,17 @@ void commit_params(dt_iop_module_t *self, dt_iop_params_t *p1, dt_dev_pixelpipe_
     }
   }
 
+  if(d->hdr_transfer)
+  {
+    hdr_linear = dt_colorspaces_linearize_profile(output);
+    if(!hdr_linear)
+    {
+      piece->process_cl_ready = FALSE;
+      return;
+    }
+    output = hdr_linear;
+  }
+
   /*
    * NOTE: theoretically, we should be passing
    * UsedDirection = LCMS_USED_AS_PROOF  into
@@ -759,6 +784,7 @@ void commit_params(dt_iop_module_t *self, dt_iop_params_t *p1, dt_dev_pixelpipe_
 
   // softproof is never the original but always a copy that went through dt_colorspaces_make_temporary_profile()
   dt_colorspaces_cleanup_profile(softproof);
+  dt_colorspaces_cleanup_profile(hdr_linear);
 
   dt_ioppr_set_pipe_output_profile_info(self->dev, piece->pipe, d->type, out_filename, p->intent);
 }
@@ -787,6 +813,9 @@ void gui_update(dt_iop_module_t *self)
 {
   dt_iop_colorout_gui_data_t *g = self->gui_data;
   dt_iop_colorout_params_t *p = self->params;
+
+  // the GUI handlers read the stored file name as a C string
+  p->filename[sizeof(p->filename) - 1] = '\0';
 
   dt_bauhaus_combobox_set(g->output_intent, (int)p->intent);
 

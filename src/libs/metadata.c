@@ -278,38 +278,23 @@ void gui_update(dt_lib_module_t *self)
 
   if(images)
   {
-    sqlite3_stmt *stmt;
-    // clang-format off
-    gchar *query = g_strdup_printf(
-                            "SELECT key, value, COUNT(id)"
-                            " FROM main.meta_data"
-                            " WHERE id IN (%s)"
-                            " GROUP BY key, value",
-                            images);
-    // clang-format on
+    GList *counts = dt_metadata_get_counts(images);
     g_free(images);
-    DT_DEBUG_SQLITE3_PREPARE_V2(dt_database_get(darktable.db), query, -1, &stmt, NULL);
 
-    while(sqlite3_step(stmt) == SQLITE_ROW)
+    for(GList *iter = counts; iter; iter = iter->next)
     {
-      if(sqlite3_column_bytes(stmt, 1))
-      {
-        const uint32_t key = (uint32_t)sqlite3_column_int(stmt, 0);
-        char *value = g_strdup((char *)sqlite3_column_text(stmt, 1));
-        const uint32_t count = (uint32_t)sqlite3_column_int(stmt, 2);
+      const dt_metadata_count_t *c = iter->data;
 
-        GList *texts = g_hash_table_lookup(d->metadata_texts, GINT_TO_POINTER(key));
-        texts = g_list_prepend(texts, value);
-        g_hash_table_replace(d->metadata_texts,
-                             GINT_TO_POINTER(key),
-                             texts);
-        g_hash_table_replace(d->metadata_counts,
-                             GINT_TO_POINTER(key),
-                             GINT_TO_POINTER((count == imgs_count) ? 2 : 1));
-      }
+      GList *texts = g_hash_table_lookup(d->metadata_texts, GINT_TO_POINTER(c->key));
+      texts = g_list_prepend(texts, g_strdup(c->value));
+      g_hash_table_replace(d->metadata_texts,
+                           GINT_TO_POINTER(c->key),
+                           texts);
+      g_hash_table_replace(d->metadata_counts,
+                           GINT_TO_POINTER(c->key),
+                           GINT_TO_POINTER((c->count == imgs_count) ? 2 : 1));
     }
-    sqlite3_finalize(stmt);
-    g_free(query);
+    g_list_free_full(counts, dt_metadata_count_free);
   }
 
   DT_ENTER_GUI_UPDATE();
@@ -448,7 +433,19 @@ static gboolean _key_pressed_cb(GtkEventControllerKey *controller,
       break;
   }
 
-  return gtk_text_view_im_context_filter_keypress(GTK_TEXT_VIEW(textview), (GdkEventKey *)gtk_get_current_event());
+  GdkEvent *event = dt_gui_get_current_event(GTK_EVENT_CONTROLLER(controller));
+#if GTK_CHECK_VERSION(4, 0, 0)
+  /* GTK4: GtkTextView's internal key controller does the IM filtering
+   * itself; gtk_text_view_im_context_filter_keypress() is gone.  Let
+   * the event propagate so the textview handles it natively. */
+  (void)event;
+  return FALSE;
+#else
+  const gboolean handled =
+    gtk_text_view_im_context_filter_keypress(GTK_TEXT_VIEW(textview), (GdkEventKey *)event);
+  gdk_event_free(event);
+  return handled;
+#endif
 }
 
 static gboolean _textview_focus(GtkWidget *widget,
@@ -830,9 +827,11 @@ static void _fill_grid(dt_lib_module_t *self)
   dt_lib_gui_queue_update(self);
 }
 
-static void _menuitem_preferences(GtkMenuItem *menuitem,
-                                  dt_lib_module_t *self)
+static void _menuitem_preferences(GSimpleAction *action,
+                                  GVariant *parameter,
+                                  gpointer user_data)
 {
+  dt_lib_module_t *self = (dt_lib_module_t *)user_data;
   dt_lib_metadata_t *d = (dt_lib_metadata_t *)self->data;
 
   GtkCellEditable *active_editable = NULL;
@@ -958,29 +957,12 @@ static void _menuitem_preferences(GtkMenuItem *menuitem,
       gtk_cell_editable_editing_done(active_editable);
 
     // delete metadata
-    GList *keys_str = NULL;
-    for(GList *key_iter = d->metadata_to_delete; key_iter; key_iter = key_iter->next)
-      keys_str = g_list_prepend(keys_str, g_strdup_printf("%d", GPOINTER_TO_INT(key_iter->data)));
-    gchar *keys = dt_util_glist_to_str(",", keys_str);
-    g_list_free_full(keys_str, g_free);
     gboolean confirm_delete = TRUE;
-    sqlite3_stmt *stmt = NULL;
 
-    if(keys)
+    if(d->metadata_to_delete)
     {
       // check for images with that metadata assigned
-      uint32_t count = 0;
-      gchar *query = g_strdup_printf("SELECT COUNT(*)"
-                                     " FROM main.meta_data"
-                                     " WHERE key in (%s)",
-                                     keys);
-      DT_DEBUG_SQLITE3_PREPARE_V2(dt_database_get(darktable.db),
-                                  query,
-                                  -1, &stmt, NULL);
-      if(sqlite3_step(stmt) == SQLITE_ROW)
-        count = sqlite3_column_int(stmt, 0);
-      sqlite3_finalize(stmt);
-      g_free(query);
+      const uint32_t count = dt_metadata_count_assigned(d->metadata_to_delete);
 
       if(count > 0)
       {
@@ -993,27 +975,7 @@ static void _menuitem_preferences(GtkMenuItem *menuitem,
       if(!confirm_delete)
         goto finish;
 
-      // delete the assignments
-      query = g_strdup_printf("DELETE FROM main.meta_data WHERE key IN (%s)",
-                              keys);
-      DT_DEBUG_SQLITE3_PREPARE_V2(dt_database_get(darktable.db),
-                                  query,
-                                  -1, &stmt, NULL);
-      sqlite3_step(stmt);
-      sqlite3_finalize(stmt);
-      g_free(query);
-
-      // now the metadata entries
-      query = g_strdup_printf("DELETE FROM data.meta_data WHERE key IN (%s)",
-                              keys);
-      DT_DEBUG_SQLITE3_PREPARE_V2(dt_database_get(darktable.db),
-                                  query,
-                                  -1, &stmt, NULL);
-      sqlite3_step(stmt);
-      sqlite3_finalize(stmt);
-      g_free(query);
-
-      g_free(keys);
+      dt_metadata_remove_keys(d->metadata_to_delete);
 
       dt_pthread_mutex_lock(&darktable.metadata_threadsafe);
       // remove the metadata from the variables substitution list
@@ -1074,22 +1036,11 @@ static void _menuitem_preferences(GtkMenuItem *menuitem,
       else
       {
         // update
-        DT_DEBUG_SQLITE3_PREPARE_V2
-          (dt_database_get(darktable.db),
-          "UPDATE data.meta_data"
-          " SET name = ?2"
-          "   , visible = ?3"
-          "   , private = ?4"
-          "   , display_order = ?5"
-          " WHERE key = ?1",
-          -1, &stmt, NULL);
-        DT_DEBUG_SQLITE3_BIND_INT(stmt, 1, key);
-        DT_DEBUG_SQLITE3_BIND_TEXT(stmt, 2, name, -1, SQLITE_TRANSIENT);
-        DT_DEBUG_SQLITE3_BIND_INT(stmt, 3, visible);
-        DT_DEBUG_SQLITE3_BIND_INT(stmt, 4, private);
-        DT_DEBUG_SQLITE3_BIND_INT(stmt, 5, display_order);
-        sqlite3_step(stmt);
-        sqlite3_finalize(stmt);
+        dt_metadata_update_metadata(&(dt_metadata_t){ .key = key,
+                                                      .name = name,
+                                                      .visible = visible,
+                                                      .priv = private,
+                                                      .display_order = display_order });
 
         dt_metadata_t *metadata = dt_metadata_get_metadata_by_keyid(key);
         g_free(metadata->name);
@@ -1119,11 +1070,12 @@ finish:
   gtk_widget_destroy(dialog);
 }
 
-void set_preferences(void *menu, dt_lib_module_t *self)
+void set_preferences(GMenu *menu, GActionGroup *action_group, dt_lib_module_t *self)
 {
-  GtkWidget *mi = gtk_menu_item_new_with_label(_("preferences..."));
-  g_signal_connect(G_OBJECT(mi), "activate", G_CALLBACK(_menuitem_preferences), self);
-  gtk_menu_shell_append(GTK_MENU_SHELL(menu), mi);
+  GSimpleAction *action = g_simple_action_new("preferences", NULL);
+  g_signal_connect(action, "activate", G_CALLBACK(_menuitem_preferences), self);
+  g_action_map_add_action(G_ACTION_MAP(action_group), G_ACTION(action));
+  g_menu_append(menu, _("preferences..."), "presets.preferences");
 }
 
 void gui_init(dt_lib_module_t *self)
@@ -1444,7 +1396,7 @@ void *legacy_params(dt_lib_module_t *self,
     if(strlen(buf) > 0)
     {
       buf += _build_tag(buf,
-                        "Xmp.xmpMM.PerservedFileName",
+                        "Xmp.xmpMM.PreservedFileName",
                         &metadata_tagnames[i],
                         &metadata_tagname_len[i],
                         &metadata_texts[i],

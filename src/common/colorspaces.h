@@ -18,6 +18,8 @@
 
 #pragma once
 
+#include "common/hdr-transfer.h"
+
 #include "common/darktable.h"
 #include "common/dttypes.h"
 
@@ -104,8 +106,30 @@ typedef enum dt_colorspaces_color_profile_type_t
   DT_COLORSPACE_PQ_P3 = 24,
   DT_COLORSPACE_HLG_P3 = 25,
   DT_COLORSPACE_DISPLAY_P3 = 26,
-  DT_COLORSPACE_LAST = 27
+  DT_COLORSPACE_FORWARD_MATRIX = 27,
+  DT_COLORSPACE_DNG_LOOK = 28,
+  DT_COLORSPACE_LAST = 29
 } dt_colorspaces_color_profile_type_t;
+
+/* Built-in CICP HDR profiles use RGB transfer functions, not ICC shapers. */
+static inline int dt_colorspaces_hdr_transfer(const dt_colorspaces_color_profile_type_t type)
+{
+  switch(type)
+  {
+    case DT_COLORSPACE_PQ_REC2020:
+    case DT_COLORSPACE_PQ_P3:
+      return DT_HDR_PQ;
+    case DT_COLORSPACE_HLG_REC2020:
+      return DT_HDR_HLG_REC2020;
+    case DT_COLORSPACE_HLG_P3:
+      return DT_HDR_HLG_P3;
+    default:
+      return DT_HDR_NONE;
+  }
+}
+
+/* Owned copy of a matrix profile with linear shapers, for HDR RGB math. */
+cmsHPROFILE dt_colorspaces_linearize_profile(cmsHPROFILE profile);
 
 typedef enum dt_colorspaces_color_mode_t
 {
@@ -188,8 +212,11 @@ typedef struct dt_colorspaces_t
 
   dt_colorspaces_color_mode_t mode;
 
+  // run these through dt_colorspaces_transform_to_display(), which needs the
+  // matching hdr transfer
   cmsHTRANSFORM transform_srgb_to_display, transform_adobe_rgb_to_display;
   cmsHTRANSFORM transform_srgb_to_display2, transform_adobe_rgb_to_display2;
+  int display_hdr_transfer, display2_hdr_transfer;
 
 } dt_colorspaces_t;
 
@@ -222,6 +249,7 @@ void dt_colorspaces_cleanup(dt_colorspaces_t *self);
 
 /** create a profile from a xyz->camera matrix. */
 cmsHPROFILE dt_colorspaces_create_xyzimatrix_profile(float cam_xyz[3][3]);
+cmsHPROFILE dt_colorspaces_create_xyzmatrix_profile(const float mat[3][3]);
 
 /** create a ICC virtual profile from the shipped presets in
  * darktable. */
@@ -394,6 +422,15 @@ dt_colorspaces_color_profile_type_t dt_colorspaces_cicp_to_type
 void dt_colorspaces_update_display_transforms();
 /** same for display2 */
 void dt_colorspaces_update_display2_transforms();
+/** 8-bit RGBA to the screen's BGRA through one of the transforms above */
+void dt_colorspaces_transform_to_display(cmsHTRANSFORM xform,
+                                         const int hdr,
+                                         const uint8_t *const in,
+                                         uint8_t *const out,
+                                         const int width,
+                                         const int height,
+                                         const size_t in_stride,
+                                         const size_t out_stride);
 
 /** Calculate CAM->XYZ, XYZ->CAM matrices **/
 gboolean dt_colorspaces_conversion_matrices_xyz(const float adobe_XYZ_to_CAM[4][3],

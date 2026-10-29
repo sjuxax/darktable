@@ -82,7 +82,6 @@
   #endif
 #endif
 
-#include <assert.h>
 #include <glib/gstdio.h>
 #include <inttypes.h>
 #include <math.h>
@@ -675,7 +674,7 @@ gboolean dt_imageio_large_thumbnail(const char *filename,
     if(dt_imageio_jpeg_decompress_header(buf, bufsize, &jpg))
       goto error;
 
-    *buffer = dt_alloc_align_uint8(4 * jpg.width * jpg.height);
+    *buffer = dt_alloc_align_uint8((size_t)4 * jpg.width * jpg.height);
     if(!*buffer) goto error;
 
     *width = jpg.width;
@@ -1040,8 +1039,6 @@ static double _get_pipescale(dt_dev_pixelpipe_t *pipe,
   return fmin(scalex, scaley);
 }
 
-// internal function: to avoid exif blob reading + 8-bit byteorder
-// flag + high-quality override
 gboolean dt_imageio_export_with_flags(const dt_imgid_t imgid,
                                       const char *filename,
                                       dt_imageio_module_format_t *format,
@@ -1101,13 +1098,16 @@ gboolean dt_imageio_export_with_flags(const dt_imgid_t imgid,
   const int wd = img->width;
   const int ht = img->height;
 
+  // Check if masks/layers are supported for this format
+  const gboolean layers = export_masks
+            && (format->flags(NULL) & FORMAT_FLAGS_SUPPORT_LAYERS) == FORMAT_FLAGS_SUPPORT_LAYERS;
+
   dt_times_t start;
   dt_get_perf_times(&start);
   dt_dev_pixelpipe_t pipe;
   gboolean res = thumbnail_export
     ? dt_dev_pixelpipe_init_thumbnail(&pipe, wd, ht)
-    : dt_dev_pixelpipe_init_export(&pipe, wd, ht,
-                                   format->levels(format_params), export_masks);
+    : dt_dev_pixelpipe_init_export(&pipe, wd, ht, format->levels(format_params), layers);
   if(!res)
   {
     dt_control_log(
@@ -1298,7 +1298,7 @@ gboolean dt_imageio_export_with_flags(const dt_imgid_t imgid,
   double scale = _get_pipescale(&pipe, width, height, max_scale);
   float origin[2] = { 0.0f, 0.0f };
 
-  if(dt_dev_distort_backtransform_plus(&dev, &pipe, 0.0,
+  if(dt_dev_distort_backtransform_plus(&dev, &pipe, 0,
                                        DT_DEV_TRANSFORM_DIR_ALL, origin, 1))
   {
     if(width == 0) width = pipe.processed_width;
@@ -1732,7 +1732,7 @@ static int _preview_write_image(dt_imageio_module_data_t *data,
   _imageio_preview_t *d = (_imageio_preview_t *)data;
 
   if(!in) return 1;
-  memcpy(d->buf, in, sizeof(uint32_t) * data->width * data->height);
+  memcpy(d->buf, in, sizeof(uint32_t) * (size_t)data->width * data->height);
   d->width = data->width;
   d->height = data->height;
 
@@ -1774,6 +1774,8 @@ cairo_surface_t *dt_imageio_preview(const dt_imgid_t imgid,
   dat.head.style_append = TRUE;
   dat.bpp = 8;
   dat.buf = (uint8_t *)dt_alloc_aligned(sizeof(uint32_t) * width * height);
+  if(!dat.buf)
+    return NULL;
 
   g_strlcpy(dat.head.style, style_name, sizeof(dat.head.style));
 
@@ -1796,6 +1798,30 @@ cairo_surface_t *dt_imageio_preview(const dt_imgid_t imgid,
     (dat.buf, CAIRO_FORMAT_RGB24, dat.head.width, dat.head.height, stride);
 
   return surface;
+}
+
+void dt_imageio_pq_light_level(const float *const rgba,
+                               const size_t npixels,
+                               float *const max_cll,
+                               float *const max_fall)
+{
+  float peak = 0.0f;
+  double sum = 0.0;
+
+  // dt_hdr_pq_decode() maps NaN to black and clamps Inf to the PQ maximum,
+  // so neither can poison the sum or overflow the writers' integer fields
+  DT_OMP_FOR_SIMD(reduction(max : peak) reduction(+ : sum))
+  for(size_t k = 0; k < npixels; k++)
+  {
+    const float *const px = &rgba[4 * k];
+    const float nits = DT_HDR_REFERENCE_WHITE_NITS
+      * dt_hdr_pq_decode(fmaxf(fmaxf(px[0], px[1]), px[2]));
+    peak = fmaxf(peak, nits);
+    sum += nits;
+  }
+
+  *max_cll = peak;
+  *max_fall = npixels ? (float)(sum / (double)npixels) : 0.0f;
 }
 
 // clang-format off

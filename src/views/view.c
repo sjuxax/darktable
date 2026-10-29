@@ -1,6 +1,6 @@
 /*
     This file is part of darktable,
-    Copyright (C) 2009-2025 darktable developers.
+    Copyright (C) 2009-2026 darktable developers.
 
     darktable is free software: you can redistribute it and/or modify
     it under the terms of the GNU General Public License as published by
@@ -73,17 +73,6 @@ void dt_view_manager_init(dt_view_manager_t *vm)
   DT_DEBUG_SQLITE3_PREPARE_V2(dt_database_get(darktable.db),
                               "SELECT num FROM main.history WHERE imgid = ?1", -1,
                               &vm->statements.have_history, NULL);
-  DT_DEBUG_SQLITE3_PREPARE_V2(dt_database_get(darktable.db),
-                              "SELECT color FROM main.color_labels WHERE imgid=?1",
-                              -1, &vm->statements.get_color, NULL);
-  DT_DEBUG_SQLITE3_PREPARE_V2(dt_database_get(darktable.db),
-                              "SELECT id"
-                              " FROM main.images"
-                              " WHERE group_id = (SELECT group_id"
-                              "                   FROM main.images"
-                              "                   WHERE id=?1)"
-                              "   AND id != ?2",
-                              -1, &vm->statements.get_grouped, NULL);
 
   vm->module_toolbox = dt_gui_hbox();
   vm->view_toolbox = dt_gui_hbox();
@@ -885,6 +874,7 @@ dt_view_surface_value_t dt_view_image_get_surface_cached(const dt_imgid_t imgid,
   {
     gboolean have_lock = FALSE;
     cmsHTRANSFORM transform = NULL;
+    int hdr = DT_HDR_NONE;
 
     if(dt_conf_get_bool("cache_color_managed"))
     {
@@ -897,11 +887,13 @@ dt_view_surface_value_t dt_view_image_get_surface_cached(const dt_imgid_t imgid,
          && darktable.color_profiles->transform_srgb_to_display)
       {
         transform = darktable.color_profiles->transform_srgb_to_display;
+        hdr = darktable.color_profiles->display_hdr_transfer;
       }
       else if(buf.color_space == DT_COLORSPACE_ADOBERGB
               && darktable.color_profiles->transform_adobe_rgb_to_display)
       {
         transform = darktable.color_profiles->transform_adobe_rgb_to_display;
+        hdr = darktable.color_profiles->display_hdr_transfer;
       }
       else
       {
@@ -924,18 +916,20 @@ dt_view_surface_value_t dt_view_image_get_surface_cached(const dt_imgid_t imgid,
       }
     }
 
-    DT_OMP_FOR()
-    for(int i = 0; i < buf.height; i++)
+    if(transform)
     {
-      const uint8_t *in = buf.buf + i * buf.width * 4;
-      uint8_t *out = rgbbuf + i * buf.width * 4;
+      dt_colorspaces_transform_to_display(transform, hdr, buf.buf, rgbbuf,
+                                          buf.width, buf.height,
+                                          (size_t)buf.width * 4, (size_t)buf.width * 4);
+    }
+    else
+    {
+      DT_OMP_FOR()
+      for(int i = 0; i < buf.height; i++)
+      {
+        const uint8_t *in = buf.buf + i * buf.width * 4;
+        uint8_t *out = rgbbuf + i * buf.width * 4;
 
-      if(transform)
-      {
-        cmsDoTransform(transform, in, out, buf.width);
-      }
-      else
-      {
         for(int j = 0; j < buf.width; j++, in += 4, out += 4)
         {
           out[0] = in[2];
@@ -1654,12 +1648,12 @@ void dt_view_accels_show(dt_view_manager_t *vm)
   gtk_box_pack_start(GTK_BOX(hb), vm->accels_window.flow_box, TRUE, TRUE, 0);
 
   GtkWidget *vb = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
-  vm->accels_window.sticky_btn = dtgtk_button_new(dtgtk_cairo_paint_multiinstance, 0, NULL);
-  gtk_widget_set_tooltip_text(vm->accels_window.sticky_btn,
-                              _("switch to a classic window which will stay open after key release"));
-  g_signal_connect(G_OBJECT(vm->accels_window.sticky_btn), "clicked",
-                   G_CALLBACK(_accels_window_sticky),
-                   vm);
+  vm->accels_window.sticky_btn = dtgtk_button_new_full(dtgtk_cairo_paint_multiinstance, 0, NULL,
+      &(dtgtk_button_config_t){
+        .tooltip = _("switch to a classic window which will stay open after key release"),
+        .clicked_cb = G_CALLBACK(_accels_window_sticky),
+        .clicked_data = vm,
+      });
   dt_gui_add_class(vm->accels_window.sticky_btn, "dt_accels_stick");
   gtk_box_pack_start(GTK_BOX(vb), vm->accels_window.sticky_btn, FALSE, FALSE, 0);
   gtk_box_pack_start(GTK_BOX(hb), vb, FALSE, FALSE, 0);
@@ -1899,7 +1893,7 @@ void dt_view_paint_surface(cairo_t *cr,
   memcpy(pts, buf_zoom_pos, sizeof(dt_dev_zoom_pos_t));
   memcpy(pts + 6, pp->backbuf_zoom_pos, sizeof(dt_dev_zoom_pos_t));
   pts[12] = port->zoom_x; pts[13] = port->zoom_y;
-  dt_dev_distort_transform_plus(dev, port->pipe, 0.0f, DT_DEV_TRANSFORM_DIR_ALL_GEOMETRY, pts, 7);
+  dt_dev_distort_transform_plus(dev, port->pipe, 0, DT_DEV_TRANSFORM_DIR_ALL_GEOMETRY, pts, 7);
 
   const float offset_x  = pts[0] / processed_width  - 0.5f;
   const float offset_y  = pts[1] / processed_height - 0.5f;

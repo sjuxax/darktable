@@ -1,6 +1,6 @@
 /*
     This file is part of darktable,
-    Copyright (C) 2017-2025 darktable developers.
+    Copyright (C) 2017-2026 darktable developers.
 
     darktable is free software: you can redistribute it and/or modify
     it under the terms of the GNU General Public License as published by
@@ -406,10 +406,10 @@ static float *_partition(float *first,
 // be in that position if the entire range [first, last) had been
 // sorted, additionally, none of the elements in the range [nth, last)
 // is less than any of the elements in the range [first, nth)
-void _quick_select(float *first,
-                   float *nth,
-                   float *last,
-                   const gboolean compatibility_mode)
+static void _quick_select(float *first,
+                          float *nth,
+                          float *last,
+                          const gboolean compatibility_mode)
 {
   if(first == last) return;
   for(;last > first+1;)
@@ -520,7 +520,10 @@ static float _ambient_light(const const_rgb_image img,
   free_gray_image(&bright_hazy);
   // average over the brightest pixels among the most hazy pixels to
   // estimate the diffusive ambient light
-  dt_aligned_pixel_t A0 = { 0.0f, 0.0f, 0.0f, 0.0f };
+  // accumulated in double: the reduction adds the threads' partial sums
+  // in the order they finish, and in float that order changed the
+  // ambient light, and so the output, from run to run
+  double A0[4] = { 0.0, 0.0, 0.0, 0.0 };
   size_t N_bright_hazy = 0;
   const float *const restrict data = dark_ch.data;
   const float *const restrict in_data = img.data;
@@ -674,7 +677,7 @@ void process(dt_iop_module_t *self,
   // finally, calculate the haze-free image, minimum allowed value for transition map
   const float t_min = CLAMP(expf(-distance * distance_max), 1.0f / 1024.0f, 1.0f);
 
-  dt_print_pipe(DT_DEBUG_VERBOSE,
+  dt_print_pipe(DT_DEBUG_PIPE | DT_DEBUG_VERBOSE,
       "ambient data", piece->pipe, self, DT_DEVICE_CPU, roi_in, roi_out,
       "tmin=%.4f distance_max=%.4f A0=%.4f %.4f %.4f", t_min, distance_max, A0[0], A0[1], A0[2]);
 
@@ -713,8 +716,12 @@ static float _ambient_light_cl(dt_iop_module_t *self,
   const int width = dt_opencl_get_image_width(img);
   const int height = dt_opencl_get_image_height(img);
   const int element_size = dt_opencl_get_image_element_size(img);
+
+  cl_int err = DT_OPENCL_SYSMEM_ALLOCATION;
   float *in = dt_alloc_aligned((size_t)width * height * element_size);
-  cl_int err = dt_opencl_copy_image_to_host(devid, in, img, width, height, element_size);
+  if(!in) goto error;
+
+  err = dt_opencl_copy_image_to_host(devid, in, img, width, height, element_size);
   if(err != CL_SUCCESS) goto error;
 
   const const_rgb_image img_in = (const_rgb_image) {in, width, height, element_size / sizeof(float)};
@@ -722,7 +729,7 @@ static float _ambient_light_cl(dt_iop_module_t *self,
   dt_free_align(in);
   return max_depth;
 error:
-  dt_print(DT_DEBUG_OPENCL, "[hazeremoval, ambient_light_cl] unknown error: %d", err);
+  dt_print(DT_DEBUG_OPENCL, "[hazeremoval, ambient_light_cl] error: %s", cl_errstr(err));
   dt_free_align(in);
   return 0.f;
 }
@@ -959,7 +966,7 @@ int process_cl(dt_iop_module_t *self,
   // finally, calculate the haze-free image
   const float t_min = CLAMP(expf(-distance * distance_max), 1.0f / 1024.0f, 1.0f);
 
-  dt_print_pipe(DT_DEBUG_VERBOSE,
+  dt_print_pipe(DT_DEBUG_PIPE | DT_DEBUG_VERBOSE,
       "ambient data", piece->pipe, self, devid, roi_in, roi_out,
       "tmin=%.4f distance_max=%.4f A0=%.4f %.4f %.4f", t_min, distance_max, A0[0], A0[1], A0[2]);
 

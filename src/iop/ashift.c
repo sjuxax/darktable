@@ -751,6 +751,48 @@ static inline void _swap_shadow_crop_box(dt_iop_ashift_params_t *p,
   tmp = p->cb; p->cb = g->cb; g->cb = tmp;
 }
 
+// process() and process_cl() publish g->buf and the geometry describing it in
+// one critical section; a reader taking the fields one by one can pair a new
+// width with an old height and fit a crop to a size that never existed, so
+// snapshot them together
+typedef struct dt_iop_ashift_bufgeom_t
+{
+  gboolean valid;   // g->buf was allocated when the snapshot was taken
+  int width;
+  int height;
+  int x_off;
+  int y_off;
+} dt_iop_ashift_bufgeom_t;
+
+static dt_iop_ashift_bufgeom_t _get_buf_geometry(dt_iop_module_t *self)
+{
+  const dt_iop_ashift_gui_data_t *g = self->gui_data;
+  dt_iop_ashift_bufgeom_t b;
+
+  dt_iop_gui_enter_critical_section(self);
+  b.valid = g->buf != NULL;
+  b.width = g->buf_width;
+  b.height = g->buf_height;
+  b.x_off = g->buf_x_off;
+  b.y_off = g->buf_y_off;
+  dt_iop_gui_leave_critical_section(self);
+
+  return b;
+}
+
+// isflipped is published by the same two writers, and stays -1 until the
+// preview pipe has run once
+static int _get_isflipped(dt_iop_module_t *self)
+{
+  const dt_iop_ashift_gui_data_t *g = self->gui_data;
+
+  dt_iop_gui_enter_critical_section(self);
+  const int isflipped = g->isflipped;
+  dt_iop_gui_leave_critical_section(self);
+
+  return isflipped;
+}
+
 #define MAT3SWAP(a, b) { float (*tmp)[3] = (a); (a) = (b); (b) = tmp; }
 
 static void _homography(float *homograph,
@@ -2296,7 +2338,7 @@ static dt_iop_ashift_nmsresult_t nmsfit(dt_iop_module_t *self,
      (mdir & ASHIFT_FIT_LENS_BOTH) != 0)
   {
     // flip all directions
-    mdir ^= g->isflipped ? ASHIFT_FIT_FLIP : 0;
+    mdir ^= _get_isflipped(self) ? ASHIFT_FIT_FLIP : 0;
     // special case that needs to be corrected
     mdir |= (mdir & ASHIFT_FIT_LINES_BOTH) == 0 ? ASHIFT_FIT_LINES_BOTH : 0;
   }
@@ -2501,7 +2543,7 @@ static void model_probe(dt_iop_module_t *self,
      (mdir & ASHIFT_FIT_LENS_BOTH) != 0)
   {
     // flip all directions
-    mdir ^= g->isflipped ? ASHIFT_FIT_FLIP : 0;
+    mdir ^= _get_isflipped(self) ? ASHIFT_FIT_FLIP : 0;
     // special case that needs to be corrected
     mdir |= (mdir & ASHIFT_FIT_LINES_BOTH) == 0 ? ASHIFT_FIT_LINES_BOTH : 0;
   }
@@ -2642,12 +2684,14 @@ static double crop_fitness(double *params, void *data)
 // center coordinates (and optionally the aspect angle) that delivers
 // the largest overall crop area.
 
-static void do_crop(const dt_iop_module_t *self, dt_iop_ashift_params_t *p)
+static void do_crop(dt_iop_module_t *self, dt_iop_ashift_params_t *p)
 {
   dt_iop_ashift_gui_data_t *g = self->gui_data;
 
+  const dt_iop_ashift_bufgeom_t b = _get_buf_geometry(self);
+
   // if sizes are not ready (module disabled), just ignore this
-  if(g->buf_width == 0 || g->buf_height == 0) return;
+  if(b.width == 0 || b.height == 0) return;
 
   // skip if fitting is still running
   if(g->fitting) return;
@@ -2679,8 +2723,8 @@ static void do_crop(const dt_iop_module_t *self, dt_iop_ashift_params_t *p)
 
   // prepare structure of constant parameters
   dt_iop_ashift_cropfit_params_t DT_ALIGNED_ARRAY cropfit;
-  cropfit.width = g->buf_width;
-  cropfit.height = g->buf_height;
+  cropfit.width = b.width;
+  cropfit.height = b.height;
   _homography((float *)cropfit.homograph, rotation, lensshift_v, lensshift_h,
               shear, f_length_kb,
               orthocorr, aspect, cropfit.width, cropfit.height, ASHIFT_HOMOGRAPH_FORWARD);
@@ -2807,7 +2851,7 @@ failed:
 }
 
 // manually adjust crop area by shifting its center
-static void crop_adjust(const dt_iop_module_t *self,
+static void crop_adjust(dt_iop_module_t *self,
                         const dt_iop_ashift_params_t *const p,
                         const float newx,
                         const float newy)
@@ -2828,8 +2872,9 @@ static void crop_adjust(const dt_iop_module_t *self,
   const float lensshift_v = p->lensshift_v;
   const float lensshift_h = p->lensshift_h;
   const float shear = p->shear;
-  const float wd = g->buf_width;
-  const float ht = g->buf_height;
+  const dt_iop_ashift_bufgeom_t b = _get_buf_geometry(self);
+  const float wd = b.width;
+  const float ht = b.height;
 
   const float alpha = atan2f(ht, wd);
 
@@ -3123,7 +3168,9 @@ static gboolean _draw_retrieve_lines_from_params(dt_iop_module_t *self,
     }
   }
 
-  if(method == ASHIFT_METHOD_LINES && p->last_drawn_lines_count > 0)
+  // the stored count indexes the fixed saved-lines array
+  if(method == ASHIFT_METHOD_LINES && p->last_drawn_lines_count > 0
+     && p->last_drawn_lines_count <= MAX_SAVED_LINES)
   {
     float pts[MAX_SAVED_LINES * 4] = { 0.0f };
 
@@ -3844,14 +3891,12 @@ static dt_hash_t _get_lines_hash(const dt_iop_ashift_line_t *lines,
 // update color information in points_idx if lines have changed in
 // terms of type (but not in terms of number or position)
 
-static gboolean _update_colors(const dt_iop_module_t *self,
+static gboolean _update_colors(dt_iop_module_t *self,
                                dt_iop_ashift_points_idx_t *points_idx,
                                const int points_lines_count)
 {
-  const dt_iop_ashift_gui_data_t *g = self->gui_data;
-
   // is the display flipped relative to the original image?
-  const gboolean isflipped = g->isflipped;
+  const gboolean isflipped = _get_isflipped(self);
 
   // go through all lines
   for(int n = 0; n < points_lines_count; n++)
@@ -3877,7 +3922,7 @@ static gboolean _update_colors(const dt_iop_module_t *self,
 }
 
 // get all the points to display lines in the gui
-static gboolean _get_points(const dt_iop_module_t *self,
+static gboolean _get_points(dt_iop_module_t *self,
                             const dt_iop_ashift_line_t *lines,
                             const int lines_count,
                             const int lines_version,
@@ -3897,7 +3942,7 @@ static gboolean _get_points(const dt_iop_module_t *self,
   float *my_extremas = NULL;
 
   // is the display flipped relative to the original image?
-  const int isflipped = g->isflipped;
+  const int isflipped = _get_isflipped(self);
 
   // allocate new index array
   my_points_idx = malloc(sizeof(dt_iop_ashift_points_idx_t) * lines_count);
@@ -4032,12 +4077,6 @@ error:
   return FALSE;
 }
 
-/* this function replaces this sentence, it calls distort_transform()
-   for this module on the pipe
-   if(!dt_dev_distort_transform_plus(self->dev, self->dev->preview_pipe,
-                                     self->priority, self->priority + 1,
-                                     (float *)V, 4))
-*/
 static int call_distort_transform(const dt_develop_t *dev,
                                   const dt_dev_pixelpipe_t *pipe,
                                   dt_iop_module_t *self,
@@ -4124,15 +4163,20 @@ void gui_post_expose(dt_iop_module_t *self,
   const double fillc = dimmed ? 0.9 : 0.2;
 
   // we draw the cropping area; we need x_off/y_off/width/height which is only available
-  // after g->buf has been processed
-  if(g->buf && self->enabled && dt_iop_has_focus(self))
+  // after g->buf has been processed. take the lock only once the cheap tests
+  // say the outline will actually be drawn
+  dt_iop_ashift_bufgeom_t b = { .valid = FALSE };
+  if(self->enabled && dt_iop_has_focus(self))
+    b = _get_buf_geometry(self);
+
+  if(b.valid)
   {
     // roi data of the preview pipe input buffer
 
-    const float iwd = g->buf_width;
-    const float iht = g->buf_height;
-    const float ixo = g->buf_x_off;
-    const float iyo = g->buf_y_off;
+    const float iwd = b.width;
+    const float iht = b.height;
+    const float ixo = b.x_off;
+    const float iyo = b.y_off;
 
     // the four corners of the input buffer of this module
     const float V[4][2] = { { ixo,        iyo       },
@@ -4289,8 +4333,7 @@ void gui_post_expose(dt_iop_module_t *self,
     {
       PangoRectangle ink;
       PangoLayout *layout;
-      PangoFontDescription *desc =
-        pango_font_description_copy_static(darktable.bauhaus->pango_font_desc);
+      PangoFontDescription *desc = dt_gui_get_font();
       pango_font_description_set_weight(desc, PANGO_WEIGHT_BOLD);
       pango_font_description_set_absolute_size
         (desc,
@@ -4330,7 +4373,7 @@ void gui_post_expose(dt_iop_module_t *self,
   // get hash value that reflects distortions from here to the end of the pixelpipe
   const dt_hash_t hash = dt_dev_hash_distort_plus(dev,
                                                   dev->preview_pipe,
-                                                  (double)self->iop_order,
+                                                  self->iop_order,
                                                   DT_DEV_TRANSFORM_DIR_FORW_INCL);
   // get hash value that changes if coordinates of lines have changed
   const dt_hash_t lines_hash = _get_lines_hash(g->lines, g->lines_count);
@@ -5278,7 +5321,8 @@ void gui_changed(dt_iop_module_t *self, GtkWidget *w, void *previous)
 #endif
 
   if(w != g->cropmode) dt_dev_invalidate_all(self->dev);
-  if(g->buf_height > 0 && g->buf_width > 0)
+  const dt_iop_ashift_bufgeom_t b = _get_buf_geometry(self);
+  if(b.height > 0 && b.width > 0)
   {
     do_crop(self, p);
     _commit_crop_box(p, g);
@@ -5326,13 +5370,14 @@ static void _event_fit_v_button_clicked(GtkGestureSingle *gesture,
 {
   DT_GUARD_GUI_UPDATE();
 
-  if(gtk_gesture_single_get_current_button(gesture) == GDK_BUTTON_PRIMARY)
+  if(dt_gui_current_button(gesture) == GDK_BUTTON_PRIMARY)
   {
     dt_iop_ashift_params_t *p = self->params;
     dt_iop_ashift_gui_data_t *g = self->gui_data;
 
-    const int control = dt_modifiers_include(dt_key_modifier_state(), GDK_CONTROL_MASK);
-    const int shift = dt_modifiers_include(dt_key_modifier_state(), GDK_SHIFT_MASK);
+    const GdkModifierType state = dt_gui_current_state(gesture);
+    const int control = dt_modifiers_include(state, GDK_CONTROL_MASK);
+    const int shift = dt_modifiers_include(state, GDK_SHIFT_MASK);
 
     dt_iop_ashift_fitaxis_t fitaxis = ASHIFT_FIT_NONE;
 
@@ -5375,13 +5420,14 @@ static void _event_fit_h_button_clicked(GtkGestureSingle *gesture,
 {
   DT_GUARD_GUI_UPDATE();
 
-  if(gtk_gesture_single_get_current_button(gesture) == GDK_BUTTON_PRIMARY)
+  if(dt_gui_current_button(gesture) == GDK_BUTTON_PRIMARY)
   {
     dt_iop_ashift_params_t *p = self->params;
     dt_iop_ashift_gui_data_t *g = self->gui_data;
 
-    const int control = dt_modifiers_include(dt_key_modifier_state(), GDK_CONTROL_MASK);
-    const int shift = dt_modifiers_include(dt_key_modifier_state(), GDK_SHIFT_MASK);
+    const GdkModifierType state = dt_gui_current_state(gesture);
+    const int control = dt_modifiers_include(state, GDK_CONTROL_MASK);
+    const int shift = dt_modifiers_include(state, GDK_SHIFT_MASK);
 
     dt_iop_ashift_fitaxis_t fitaxis = ASHIFT_FIT_NONE;
 
@@ -5424,13 +5470,14 @@ static void _event_fit_both_button_clicked(GtkGestureSingle *gesture,
 {
   DT_GUARD_GUI_UPDATE();
 
-  if(gtk_gesture_single_get_current_button(gesture) == GDK_BUTTON_PRIMARY)
+  if(dt_gui_current_button(gesture) == GDK_BUTTON_PRIMARY)
   {
     dt_iop_ashift_params_t *p = self->params;
     dt_iop_ashift_gui_data_t *g = self->gui_data;
 
-    const int control = dt_modifiers_include(dt_key_modifier_state(), GDK_CONTROL_MASK);
-    const int shift = dt_modifiers_include(dt_key_modifier_state(), GDK_SHIFT_MASK);
+    const GdkModifierType state = dt_gui_current_state(gesture);
+    const int control = dt_modifiers_include(state, GDK_CONTROL_MASK);
+    const int shift = dt_modifiers_include(state, GDK_SHIFT_MASK);
 
     dt_iop_ashift_fitaxis_t fitaxis = ASHIFT_FIT_NONE;
 
@@ -5476,15 +5523,16 @@ static void _event_structure_auto_clicked(GtkGestureSingle *gesture,
   GtkWidget *widget = dt_gui_get_widget(gesture);
   DT_GUARD_GUI_UPDATE();
 
-  if(gtk_gesture_single_get_current_button(gesture) == GDK_BUTTON_PRIMARY)
+  if(dt_gui_current_button(gesture) == GDK_BUTTON_PRIMARY)
   {
     dt_iop_ashift_params_t *p = self->params;
     dt_iop_ashift_gui_data_t *g = self->gui_data;
 
     _do_clean_structure(self, p, TRUE);
 
-    const int control = dt_modifiers_include(dt_key_modifier_state(), GDK_CONTROL_MASK);
-    const int shift = dt_modifiers_include(dt_key_modifier_state(), GDK_SHIFT_MASK);
+    const GdkModifierType state = dt_gui_current_state(gesture);
+    const int control = dt_modifiers_include(state, GDK_CONTROL_MASK);
+    const int shift = dt_modifiers_include(state, GDK_SHIFT_MASK);
 
     dt_iop_ashift_enhance_t enhance;
 
@@ -5503,7 +5551,7 @@ static void _event_structure_auto_clicked(GtkGestureSingle *gesture,
     {
       _gui_update_structure_states(self, widget);
       dt_control_queue_redraw_center();
-    
+      return;
     }
     else
     {
@@ -5556,6 +5604,16 @@ static void _event_process_after_preview_callback(gpointer instance, dt_iop_modu
   switch(jobcode)
   {
     case ASHIFT_JOBCODE_DO_CROP:
+    {
+      // the signal can come from a preview run that started before the
+      // module was enabled and so never filled g->buf; do_crop() would
+      // return without cropping, so keep the request for the next run
+      const dt_iop_ashift_bufgeom_t b = _get_buf_geometry(self);
+      if(b.width == 0 || b.height == 0)
+      {
+        g->jobcode = ASHIFT_JOBCODE_DO_CROP;
+        break;
+      }
       do_crop(self, p);
       _commit_crop_box(p, g);
       // save all that
@@ -5564,6 +5622,7 @@ static void _event_process_after_preview_callback(gpointer instance, dt_iop_modu
       _swap_shadow_crop_box(p, g);
       dt_dev_invalidate_all(darktable.develop);
       break;
+    }
 
     case ASHIFT_JOBCODE_GET_STRUCTURE_QUAD:
       _do_get_structure_quad(self);
@@ -5799,9 +5858,7 @@ static gboolean _event_draw(GtkWidget *widget,
   const dt_iop_ashift_gui_data_t *g = self->gui_data;
   DT_GUARD_GUI_UPDATE(FALSE);
 
-  dt_iop_gui_enter_critical_section(self);
-  const int isflipped = g->isflipped;
-  dt_iop_gui_leave_critical_section(self);
+  const int isflipped = _get_isflipped(self);
 
   if(isflipped == -1) return FALSE;
 
@@ -5916,6 +5973,21 @@ static void _event_structure_lines_clicked(GtkGestureSingle *gesture,
   dt_dev_add_history_item(darktable.develop, self, TRUE);
 
 
+}
+
+// the structure buttons implement radio-button behavior by managing all
+// toggle states themselves, so keep GTK from flipping the button on release:
+// claim the sequence in CAPTURE phase (same pattern as dt_iop_togglebutton_new)
+// and the button's own bubble-phase gesture never emits "clicked"
+static GtkGestureSingle *_connect_structure_button(GtkWidget *widget,
+                                                   GCallback pressed,
+                                                   dt_iop_module_t *self)
+{
+  GtkGestureSingle *gesture = dt_gui_connect_click(widget, pressed, NULL, self);
+  gtk_event_controller_set_propagation_phase(GTK_EVENT_CONTROLLER(gesture),
+                                             GTK_PHASE_CAPTURE);
+  g_signal_connect(G_OBJECT(gesture), "begin", G_CALLBACK(dt_gui_gesture_claim), NULL);
+  return gesture;
 }
 
 void gui_init(dt_iop_module_t *self)
@@ -6117,12 +6189,18 @@ void gui_init(dt_iop_module_t *self)
     (g->structure_quad, _("manually define perspective rectangle"));
   gtk_widget_set_tooltip_text(g->structure_lines, _("manually draw structure lines"));
 
-  dt_gui_connect_click(g->fit_v, _event_fit_v_button_clicked, NULL, self);
-  dt_gui_connect_click(g->fit_h, _event_fit_h_button_clicked, NULL, self);
-  dt_gui_connect_click(g->fit_both, _event_fit_both_button_clicked, NULL, self);
-  dt_gui_connect_click(g->structure_quad, _event_structure_quad_clicked, NULL, self);
-  dt_gui_connect_click(g->structure_lines, _event_structure_lines_clicked, NULL, self);
-  dt_gui_connect_click(g->structure_auto, _event_structure_auto_clicked, NULL, self);
+  g_object_set_data(G_OBJECT(g->fit_v), DT_ACTION_GESTURE_KEY,
+                    dt_gui_connect_click(g->fit_v, _event_fit_v_button_clicked, NULL, self));
+  g_object_set_data(G_OBJECT(g->fit_h), DT_ACTION_GESTURE_KEY,
+                    dt_gui_connect_click(g->fit_h, _event_fit_h_button_clicked, NULL, self));
+  g_object_set_data(G_OBJECT(g->fit_both), DT_ACTION_GESTURE_KEY,
+                    dt_gui_connect_click(g->fit_both, _event_fit_both_button_clicked, NULL, self));
+  g_object_set_data(G_OBJECT(g->structure_quad), DT_ACTION_GESTURE_KEY,
+                    _connect_structure_button(g->structure_quad, G_CALLBACK(_event_structure_quad_clicked), self));
+  g_object_set_data(G_OBJECT(g->structure_lines), DT_ACTION_GESTURE_KEY,
+                    _connect_structure_button(g->structure_lines, G_CALLBACK(_event_structure_lines_clicked), self));
+  g_object_set_data(G_OBJECT(g->structure_auto), DT_ACTION_GESTURE_KEY,
+                    _connect_structure_button(g->structure_auto, G_CALLBACK(_event_structure_auto_clicked), self));
   g_signal_connect(G_OBJECT(self->widget), "draw", G_CALLBACK(_event_draw), self);
 
   dt_action_define_iop(self, N_("fit"),

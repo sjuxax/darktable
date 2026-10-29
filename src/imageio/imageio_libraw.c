@@ -1,6 +1,6 @@
 /*
     This file is part of darktable,
-    Copyright (C) 2021-2024 darktable developers.
+    Copyright (C) 2021-2026 darktable developers.
 
     darktable is free software: you can redistribute it and/or modify
     it under the terms of the GNU General Public License as published by
@@ -29,7 +29,6 @@
 
 #include <libraw/libraw.h>
 
-#include <assert.h>
 #include <inttypes.h>
 #include <memory.h>
 #include <stdio.h>
@@ -333,7 +332,7 @@ static gboolean _supported_image(const gchar *filename)
 
 // Issue a warning, but only if we haven't done so
 // for that particular model in this darktable session
-void _check_libraw_missing_support(const struct dt_image_t *img)
+static void _check_libraw_missing_support(const struct dt_image_t *img)
 {
   char lr_mk[64], lr_md[64], lr_al[64];
   if(!is_in_glist(warning_missing_support_seen, img->exif_model) &&

@@ -16,7 +16,6 @@
     along with darktable.  If not, see <http://www.gnu.org/licenses/>.
 */
 
-#include <assert.h>
 #include <lcms2.h>
 #include <math.h>
 #include <stdlib.h>
@@ -724,7 +723,7 @@ void commit_params(dt_iop_module_t *self,
   chr->late_correction = p->preset == DT_IOP_TEMP_D65_LATE;
   chr->temperature = piece->enabled ? self : NULL;
   if(dt_pipe_is_preview(pipe) && !piece->enabled)
-    dt_iop_set_module_trouble_message(self, NULL, NULL, NULL);
+    dt_iop_clear_module_trouble_message(self);
 }
 
 void init_pipe(dt_iop_module_t *self,
@@ -1802,11 +1801,7 @@ static void _preset_tune_callback(GtkWidget *widget, dt_iop_module_t *self)
       break;
     case DT_IOP_TEMP_SPOT: // from image area wb, expose callback will set p->rgbg2.
       if(!gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(g->colorpicker)))
-      {
-        gboolean ret_val;
-        g_signal_emit_by_name(G_OBJECT(g->colorpicker), "button-press-event",
-                              NULL, &ret_val);
-      }
+        dt_iop_color_picker_toggle(g->colorpicker, DT_ACTION_EFFECT_TOGGLE, 1.0);
       break;
     case DT_IOP_TEMP_USER: // directly changing one of the coeff
                            // sliders also changes the mod_coeff so it
@@ -2076,7 +2071,7 @@ void gui_init(dt_iop_module_t *self)
   g->colorpicker = dt_color_picker_new_with_cst(self, DT_COLOR_PICKER_AREA,
                                                 NULL, IOP_CS_NONE);
   dt_action_define_iop(self, N_("settings"), N_("from image area"),
-                       g->colorpicker, &dt_action_def_toggle);
+                       g->colorpicker, &dt_action_def_color_picker);
   dtgtk_togglebutton_set_paint(DTGTK_TOGGLEBUTTON(g->colorpicker),
                                dtgtk_cairo_paint_colorpicker, 0, NULL);
   dt_gui_add_class(g->colorpicker, "dt_transparent_background");
